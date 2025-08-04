@@ -61,163 +61,168 @@ with tab1:
 
     if sample.empty:
         st.warning("No data available for this ticker. Try another.")
-    elif pd.isna(sample['Date'].min()) or pd.isna(sample['Date'].max()):
-        st.warning("This ticker has no valid date range. Try another ticker.")
     else:
-        # Price trend
-        st.write("**A. Price Trend**")
-        fig, ax = plt.subplots()
-        ax.plot(sample['Date'], sample['Close'], color='navy')
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Close")
-        ax.set_title(f"{ticker} Closing Price")
-        st.pyplot(fig)
-
-        # Date range slider (safe version)
-        min_date, max_date = sample['Date'].min(), sample['Date'].max()
-        date_range = st.slider(
-            "Select Date Range",
-            min_value=min_date,
-            max_value=max_date,
-            value=(min_date, max_date)
-        )
-        mask = (sample['Date'] >= date_range[0]) & (sample['Date'] <= date_range[1])
-        selected = sample[mask].copy()
-
-        # Daily return histogram
-        st.write("**C. Daily Return Distribution**")
-        fig2, ax2 = plt.subplots()
-        ax2.hist(selected['Return'].dropna(), bins=50, color='teal')
-        ax2.set_xlabel("Return")
-        ax2.set_ylabel("Frequency")
-        st.pyplot(fig2)
-
-        # SMA
-        st.write("**D. 20-Day SMA vs Close**")
-        fig3, ax3 = plt.subplots()
-        ax3.plot(selected['Date'], selected['Close'], label='Close', color='navy')
-        if 'SMA_20' in selected.columns:
-            ax3.plot(selected['Date'], selected['SMA_20'], label='SMA 20', color='orange')
-        ax3.legend()
-        st.pyplot(fig3)
-
-        # Volatility
-        st.write("**E. Volatility (20-Day Rolling Std)**")
-        if 'Volatility_20' in selected.columns:
-            fig4, ax4 = plt.subplots()
-            ax4.plot(selected['Date'], selected['Volatility_20'], color='red')
-            ax4.set_xlabel("Date")
-            ax4.set_ylabel("Volatility")
-            st.pyplot(fig4)
-
-        # Rolling mean/vol window
-        st.write("**F. Rolling Mean & Volatility**")
-        window = st.slider("Rolling window (days)", min_value=5, max_value=100, value=20, step=5)
-        selected['Rolling_Mean'] = selected['Close'].rolling(window).mean()
-        selected['Rolling_Vol'] = selected['Return'].rolling(window).std()
-        fig5, ax5 = plt.subplots()
-        ax5.plot(selected['Date'], selected['Close'], label='Close', color='navy')
-        ax5.plot(selected['Date'], selected['Rolling_Mean'], label=f'Rolling Mean ({window}d)', color='green')
-        ax5.legend()
-        st.pyplot(fig5)
-        fig6, ax6 = plt.subplots()
-        ax6.plot(selected['Date'], selected['Rolling_Vol'], color='crimson')
-        ax6.set_xlabel("Date")
-        ax6.set_ylabel(f"Volatility ({window}d std of returns)")
-        st.pyplot(fig6)
-
-        # Cumulative returns
-        st.write("**G. Cumulative Returns**")
-        selected['Cumulative'] = (1 + selected['Return'].fillna(0)).cumprod()
-        fig7, ax7 = plt.subplots()
-        ax7.plot(selected['Date'], selected['Cumulative'], color='purple')
-        ax7.set_xlabel("Date")
-        ax7.set_ylabel("Cumulative Growth ($1 baseline)")
-        st.pyplot(fig7)
-
-        # Correlation heatmap
-        st.write("**H. Correlation Heatmap**")
-        heatmap_features = [c for c in ['Close', 'Return', 'SMA_20', 'Volatility_20'] if c in selected.columns]
-        if len(heatmap_features) >= 2:
-            corr_data = selected[heatmap_features].dropna().corr()
-            fig8, ax8 = plt.subplots()
-            sns.heatmap(corr_data, annot=True, fmt=".2f", cmap='coolwarm', ax=ax8)
-            st.pyplot(fig8)
+        # Date slider - bulletproof!
+        min_date_raw, max_date_raw = sample['Date'].min(), sample['Date'].max()
+        if pd.isnull(min_date_raw) or pd.isnull(max_date_raw):
+            st.warning("This ticker has no valid date range. Try another ticker.")
         else:
-            st.info("Not enough features for correlation heatmap.")
+            min_date = pd.to_datetime(min_date_raw).to_pydatetime()
+            max_date = pd.to_datetime(max_date_raw).to_pydatetime()
 
-        # Outlier detection
-        st.write("**I. Outlier Detection**")
-        if 'Return' in selected.columns:
-            ups = selected.nlargest(5, 'Return')[['Date', 'Return']]
-            downs = selected.nsmallest(5, 'Return')[['Date', 'Return']]
-            st.write("Top 5 Positive Return Days:")
-            st.table(ups)
-            st.write("Top 5 Negative Return Days:")
-            st.table(downs)
+            # Price trend
+            st.write("**A. Price Trend**")
+            fig, ax = plt.subplots()
+            ax.plot(sample['Date'], sample['Close'], color='navy')
+            ax.set_xlabel("Date")
+            ax.set_ylabel("Close")
+            ax.set_title(f"{ticker} Closing Price")
+            st.pyplot(fig)
 
-        # Drawdown plot
-        st.write("**J. Drawdown Plot**")
-        if 'Close' in selected.columns:
-            running_max = selected['Close'].cummax()
-            drawdown = (selected['Close'] - running_max) / running_max
-            fig9, ax9 = plt.subplots()
-            ax9.plot(selected['Date'], drawdown, color='brown')
-            ax9.set_xlabel("Date")
-            ax9.set_ylabel("Drawdown (relative)")
-            st.pyplot(fig9)
+            date_range = st.slider(
+                "Select Date Range",
+                min_value=min_date,
+                max_value=max_date,
+                value=(min_date, max_date)
+            )
+            mask = (sample['Date'] >= date_range[0]) & (sample['Date'] <= date_range[1])
+            selected = sample[mask].copy()
 
-        # Risk-return scatter
-        st.write("**K. Risk-Return Scatterplot**")
-        if 'Return' in df.columns:
-            means = df.groupby('Ticker')['Return'].mean()
-            stds = df.groupby('Ticker')['Return'].std()
-            fig10, ax10 = plt.subplots()
-            ax10.scatter(stds, means, alpha=0.7)
-            ax10.set_xlabel("Volatility (std)")
-            ax10.set_ylabel("Mean Return")
-            ax10.set_title("Risk-Return by Ticker")
-            for tick in means.index:
-                ax10.annotate(tick, (stds[tick], means[tick]), fontsize=7, alpha=0.7)
-            st.pyplot(fig10)
+            # Daily return histogram
+            st.write("**C. Daily Return Distribution**")
+            fig2, ax2 = plt.subplots()
+            ax2.hist(selected['Return'].dropna(), bins=50, color='teal')
+            ax2.set_xlabel("Return")
+            ax2.set_ylabel("Frequency")
+            st.pyplot(fig2)
 
-        # Rolling beta to index (if possible)
-        if index_ticker and ticker != index_ticker and 'Return' in selected.columns:
-            st.write(f"**L. Rolling Beta to Index ({index_ticker})**")
-            ticker_returns = selected.set_index('Date')['Return']
-            index_returns = df[df['Ticker'] == index_ticker].set_index('Date')['Return'].reindex(selected['Date'])
-            beta_win = st.slider("Beta window (days)", min_value=20, max_value=120, value=60, step=10)
-            betas = []
-            for i in range(len(ticker_returns)):
-                if i < beta_win: betas.append(np.nan); continue
-                y = ticker_returns.iloc[i-beta_win:i].values
-                x = index_returns.iloc[i-beta_win:i].values
-                if np.isnan(y).any() or np.isnan(x).any(): betas.append(np.nan); continue
-                beta = np.polyfit(x, y, 1)[0]
-                betas.append(beta)
-            fig11, ax11 = plt.subplots()
-            ax11.plot(selected['Date'], betas, color='darkorange')
-            ax11.set_xlabel("Date")
-            ax11.set_ylabel(f"Beta (window={beta_win})")
-            st.pyplot(fig11)
+            # SMA
+            st.write("**D. 20-Day SMA vs Close**")
+            fig3, ax3 = plt.subplots()
+            ax3.plot(selected['Date'], selected['Close'], label='Close', color='navy')
+            if 'SMA_20' in selected.columns:
+                ax3.plot(selected['Date'], selected['SMA_20'], label='SMA 20', color='orange')
+            ax3.legend()
+            st.pyplot(fig3)
 
-        # Autocorrelation plot
-        st.write("**M. Autocorrelation of Returns**")
-        if 'Return' in selected.columns:
-            acf_lags = st.slider("Autocorrelation lags", min_value=5, max_value=60, value=20, step=5)
-            acf_vals = acf(selected['Return'].dropna(), nlags=acf_lags)
-            fig12, ax12 = plt.subplots()
-            ax12.bar(range(acf_lags+1), acf_vals, color='dodgerblue')
-            ax12.set_xlabel("Lag")
-            ax12.set_ylabel("Autocorrelation")
-            ax12.set_title("Autocorrelation of Returns")
-            st.pyplot(fig12)
+            # Volatility
+            st.write("**E. Volatility (20-Day Rolling Std)**")
+            if 'Volatility_20' in selected.columns:
+                fig4, ax4 = plt.subplots()
+                ax4.plot(selected['Date'], selected['Volatility_20'], color='red')
+                ax4.set_xlabel("Date")
+                ax4.set_ylabel("Volatility")
+                st.pyplot(fig4)
 
-        # Missing data
-        st.write("**N. Missing Data Check**")
-        missing = selected.isnull().astype(int)
-        st.dataframe(missing.sum().reset_index().rename(columns={0:'MissingCount'}))
+            # Rolling mean/vol window
+            st.write("**F. Rolling Mean & Volatility**")
+            window = st.slider("Rolling window (days)", min_value=5, max_value=100, value=20, step=5)
+            selected['Rolling_Mean'] = selected['Close'].rolling(window).mean()
+            selected['Rolling_Vol'] = selected['Return'].rolling(window).std()
+            fig5, ax5 = plt.subplots()
+            ax5.plot(selected['Date'], selected['Close'], label='Close', color='navy')
+            ax5.plot(selected['Date'], selected['Rolling_Mean'], label=f'Rolling Mean ({window}d)', color='green')
+            ax5.legend()
+            st.pyplot(fig5)
+            fig6, ax6 = plt.subplots()
+            ax6.plot(selected['Date'], selected['Rolling_Vol'], color='crimson')
+            ax6.set_xlabel("Date")
+            ax6.set_ylabel(f"Volatility ({window}d std of returns)")
+            st.pyplot(fig6)
 
-        st.markdown("> **Interpretation:** This comprehensive EDA suite supports all research objectives, giving you the data depth and analytical tools needed for top-tier finance research.")
+            # Cumulative returns
+            st.write("**G. Cumulative Returns**")
+            selected['Cumulative'] = (1 + selected['Return'].fillna(0)).cumprod()
+            fig7, ax7 = plt.subplots()
+            ax7.plot(selected['Date'], selected['Cumulative'], color='purple')
+            ax7.set_xlabel("Date")
+            ax7.set_ylabel("Cumulative Growth ($1 baseline)")
+            st.pyplot(fig7)
 
-# --- Keep the rest of your ML Results, Interpretation, and About tabs as in your last working version ---
+            # Correlation heatmap
+            st.write("**H. Correlation Heatmap**")
+            heatmap_features = [c for c in ['Close', 'Return', 'SMA_20', 'Volatility_20'] if c in selected.columns]
+            if len(heatmap_features) >= 2:
+                corr_data = selected[heatmap_features].dropna().corr()
+                fig8, ax8 = plt.subplots()
+                sns.heatmap(corr_data, annot=True, fmt=".2f", cmap='coolwarm', ax=ax8)
+                st.pyplot(fig8)
+            else:
+                st.info("Not enough features for correlation heatmap.")
+
+            # Outlier detection
+            st.write("**I. Outlier Detection**")
+            if 'Return' in selected.columns:
+                ups = selected.nlargest(5, 'Return')[['Date', 'Return']]
+                downs = selected.nsmallest(5, 'Return')[['Date', 'Return']]
+                st.write("Top 5 Positive Return Days:")
+                st.table(ups)
+                st.write("Top 5 Negative Return Days:")
+                st.table(downs)
+
+            # Drawdown plot
+            st.write("**J. Drawdown Plot**")
+            if 'Close' in selected.columns:
+                running_max = selected['Close'].cummax()
+                drawdown = (selected['Close'] - running_max) / running_max
+                fig9, ax9 = plt.subplots()
+                ax9.plot(selected['Date'], drawdown, color='brown')
+                ax9.set_xlabel("Date")
+                ax9.set_ylabel("Drawdown (relative)")
+                st.pyplot(fig9)
+
+            # Risk-return scatter
+            st.write("**K. Risk-Return Scatterplot**")
+            if 'Return' in df.columns:
+                means = df.groupby('Ticker')['Return'].mean()
+                stds = df.groupby('Ticker')['Return'].std()
+                fig10, ax10 = plt.subplots()
+                ax10.scatter(stds, means, alpha=0.7)
+                ax10.set_xlabel("Volatility (std)")
+                ax10.set_ylabel("Mean Return")
+                ax10.set_title("Risk-Return by Ticker")
+                for tick in means.index:
+                    ax10.annotate(tick, (stds[tick], means[tick]), fontsize=7, alpha=0.7)
+                st.pyplot(fig10)
+
+            # Rolling beta to index (if possible)
+            if index_ticker and ticker != index_ticker and 'Return' in selected.columns:
+                st.write(f"**L. Rolling Beta to Index ({index_ticker})**")
+                ticker_returns = selected.set_index('Date')['Return']
+                index_returns = df[df['Ticker'] == index_ticker].set_index('Date')['Return'].reindex(selected['Date'])
+                beta_win = st.slider("Beta window (days)", min_value=20, max_value=120, value=60, step=10)
+                betas = []
+                for i in range(len(ticker_returns)):
+                    if i < beta_win: betas.append(np.nan); continue
+                    y = ticker_returns.iloc[i-beta_win:i].values
+                    x = index_returns.iloc[i-beta_win:i].values
+                    if np.isnan(y).any() or np.isnan(x).any(): betas.append(np.nan); continue
+                    beta = np.polyfit(x, y, 1)[0]
+                    betas.append(beta)
+                fig11, ax11 = plt.subplots()
+                ax11.plot(selected['Date'], betas, color='darkorange')
+                ax11.set_xlabel("Date")
+                ax11.set_ylabel(f"Beta (window={beta_win})")
+                st.pyplot(fig11)
+
+            # Autocorrelation plot
+            st.write("**M. Autocorrelation of Returns**")
+            if 'Return' in selected.columns:
+                acf_lags = st.slider("Autocorrelation lags", min_value=5, max_value=60, value=20, step=5)
+                acf_vals = acf(selected['Return'].dropna(), nlags=acf_lags)
+                fig12, ax12 = plt.subplots()
+                ax12.bar(range(acf_lags+1), acf_vals, color='dodgerblue')
+                ax12.set_xlabel("Lag")
+                ax12.set_ylabel("Autocorrelation")
+                ax12.set_title("Autocorrelation of Returns")
+                st.pyplot(fig12)
+
+            # Missing data
+            st.write("**N. Missing Data Check**")
+            missing = selected.isnull().astype(int)
+            st.dataframe(missing.sum().reset_index().rename(columns={0:'MissingCount'}))
+
+            st.markdown("> **Interpretation:** This comprehensive EDA suite supports all research objectives, giving you the data depth and analytical tools needed for top-tier finance research.")
+
+# --- Keep your Tab 2 (ML Results), Tab 3 (Interpretation), Tab 4 (Objectives) as before ---
+
