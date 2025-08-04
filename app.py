@@ -9,7 +9,6 @@ from sklearn.preprocessing import StandardScaler
 
 st.set_page_config(page_title="ML in Finance – Research Dashboard", layout="wide")
 
-# --- 1. Setup: markets, load data, sidebar controls
 markets = {
     'S&P 500': 'sp500_full_features.csv',
     'Nifty 50': 'nifty50_full_features.csv',
@@ -21,7 +20,7 @@ st.sidebar.header("Dashboard Controls")
 market = st.sidebar.selectbox("Select Market", list(markets.keys()), help="Choose which market to analyze.")
 df = pd.read_csv(markets[market])
 ticker = st.sidebar.selectbox("Select Ticker", sorted(df['Ticker'].unique()), help="Choose company to visualize.")
-sample = df[df['Ticker'] == ticker]
+sample = df[df['Ticker'] == ticker].copy()
 
 st.title("Machine Learning in Finance: Multi-Market Research Dashboard")
 st.markdown("""
@@ -32,7 +31,6 @@ st.markdown("""
 - *Provide transparent, empirical findings—not just theoretical accuracy*
 """)
 
-# --- 2. Now create the tabs
 tab1, tab2, tab3, tab4 = st.tabs([
     "1. Data Visualization (Objective 1,3)",
     "2. ML Model Results (Objective 2,3)",
@@ -40,11 +38,10 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "4. About & Research Objectives"
 ])
 
-# -------- TAB 1: Data Visualization --------
 with tab1:
     st.header(f"EDA for {ticker} in {market}")
-    st.write("**A. Price Trend** – Visualizes long-term movement, key for asset selection, regime shifts, and real-world investment insight.")
 
+    st.write("**A. Price Trend** – Visualizes long-term movement, key for asset selection, regime shifts, and real-world investment insight.")
     fig, ax = plt.subplots()
     ax.plot(sample['Date'], sample['Close'], color='navy')
     ax.set_xlabel("Date")
@@ -53,7 +50,6 @@ with tab1:
     st.pyplot(fig)
 
     st.write("**B. Daily Return Distribution** – Shows market risk/volatility; 'fatter' tails mean higher risk of extreme moves.")
-
     fig2, ax2 = plt.subplots()
     ax2.hist(sample['Return'].dropna(), bins=50, color='teal')
     ax2.set_xlabel("Return")
@@ -61,7 +57,6 @@ with tab1:
     st.pyplot(fig2)
 
     st.write("**C. 20-Day SMA vs Close** – Moving average (trend-following) helps visualize smoothing, momentum for strategies like asset allocation.")
-
     fig3, ax3 = plt.subplots()
     ax3.plot(sample['Date'], sample['Close'], label='Close', color='navy')
     if 'SMA_20' in sample.columns:
@@ -70,7 +65,6 @@ with tab1:
     st.pyplot(fig3)
 
     st.write("**D. Volatility (20-Day Rolling Std)** – Risk management: periods of high/low volatility are key for real-world decisions.")
-
     if 'Volatility_20' in sample.columns:
         fig4, ax4 = plt.subplots()
         ax4.plot(sample['Date'], sample['Volatility_20'], color='red')
@@ -80,7 +74,62 @@ with tab1:
 
     st.markdown("> **Interpretation:** These plots help investors and researchers assess asset behavior, volatility, and risk—crucial for portfolio construction and asset selection. (Objective 1,3)")
 
-# -------- TAB 2: ML Model Results (LIVE) --------
+    # ----- ADVANCED EDA -----
+    st.write("**E. Rolling Mean & Rolling Volatility** – Use sliders to adjust the window size and observe smoothing/risk.")
+    window = st.slider("Select rolling window (days)", min_value=5, max_value=100, value=20, step=5)
+    sample['Rolling_Mean'] = sample['Close'].rolling(window).mean()
+    sample['Rolling_Vol'] = sample['Return'].rolling(window).std()
+
+    fig5, ax5 = plt.subplots()
+    ax5.plot(sample['Date'], sample['Close'], label='Close', color='navy')
+    ax5.plot(sample['Date'], sample['Rolling_Mean'], label=f'Rolling Mean ({window}d)', color='green')
+    ax5.legend()
+    st.pyplot(fig5)
+    st.caption(f"Rolling mean helps smooth noise; window size controls sensitivity. Larger = smoother.")
+
+    fig6, ax6 = plt.subplots()
+    ax6.plot(sample['Date'], sample['Rolling_Vol'], color='crimson')
+    ax6.set_xlabel("Date")
+    ax6.set_ylabel(f"Volatility ({window}d std of returns)")
+    st.pyplot(fig6)
+    st.caption(f"Rolling volatility (std of returns over {window} days): higher = more risk.")
+
+    st.write("**F. Cumulative Returns** – See growth of $1 invested (ignoring dividends/fees).")
+    sample['Cumulative'] = (1 + sample['Return'].fillna(0)).cumprod()
+    fig7, ax7 = plt.subplots()
+    ax7.plot(sample['Date'], sample['Cumulative'], color='purple')
+    ax7.set_xlabel("Date")
+    ax7.set_ylabel("Cumulative Growth ($1 baseline)")
+    st.pyplot(fig7)
+    st.caption("Shows how an initial $1 would have grown, making it easy to compare long-run performance.")
+
+    st.write("**G. Risk-Return Scatterplot** – Visualize mean return vs. volatility for all tickers (market risk/return tradeoff).")
+    means = df.groupby('Ticker')['Return'].mean()
+    stds = df.groupby('Ticker')['Return'].std()
+    fig8, ax8 = plt.subplots()
+    ax8.scatter(stds, means, alpha=0.7)
+    ax8.set_xlabel("Volatility (std)")
+    ax8.set_ylabel("Mean Return")
+    ax8.set_title("Risk-Return by Ticker")
+    for tick in means.index:
+        ax8.annotate(tick, (stds[tick], means[tick]), fontsize=7, alpha=0.7)
+    st.pyplot(fig8)
+    st.caption("Risk-Return chart helps spot tickers with high risk or high average return.")
+
+    st.write("**H. Interactive Histogram** – Choose bins for return histogram.")
+    bins = st.slider("Histogram bins", min_value=10, max_value=100, value=50, step=10)
+    fig9, ax9 = plt.subplots()
+    ax9.hist(sample['Return'].dropna(), bins=bins, color='skyblue')
+    st.pyplot(fig9)
+    st.caption("Adjust bin count to see finer or coarser return distribution.")
+
+    st.write("**I. Missing Data Check** – See which columns have missing values.")
+    missing = sample.isnull().astype(int)
+    st.dataframe(missing.sum().reset_index().rename(columns={0:'MissingCount'}))
+    st.caption("Columns with more missing values may require cleaning or careful analysis.")
+
+    st.markdown("> **Interpretation:** These advanced plots help answer deeper research questions about risk, return, stability, and data quality—adding rigor and supporting robust portfolio analysis (Objective 1).")
+
 with tab2:
     st.header(f"Model Benchmarking for All Markets")
     st.info("Click the button below to automatically run RandomForest, SVM, and ANN on each market. Results will appear in the table and can be downloaded for your report.")
@@ -155,7 +204,6 @@ with tab2:
     - **No manual file uploads required – everything runs and appears instantly!**
     """)
 
-# -------- TAB 3: Interpretation --------
 with tab3:
     st.header("Cross-Market and Cross-Model Insights")
     st.markdown("""
@@ -168,7 +216,6 @@ with tab3:
 *Map each insight here to your objectives in your mid review discussion.*
 """)
 
-# -------- TAB 4: About / Research Objectives --------
 with tab4:
     st.header("About this Research & Dashboard")
     st.markdown("""
