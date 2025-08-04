@@ -311,13 +311,17 @@ with tab2:
 with tab3:
     st.header("Cross-Market and Cross-Model Insights")
     st.markdown("""
-- **ML models (Random Forest, SVM, ANN) generally fail to beat random guessing for daily up/down prediction, even with advanced features.**
-- **Similar results across S&P 500, Nifty 50, FTSE 100, and Bovespa highlight that this is not just a U.S./Europe phenomenon.**
-- **This supports the view that financial markets are efficient and difficult to predict at short-term horizons.**
-- **Your analysis demonstrates the *real-world effect* (or limitation) of ML models in actual investment settings, not just in-sample theory.**
-- **Further work could analyze longer-term prediction, alternative data, or real portfolio backtesting.**
+### Main Takeaways:
 
-*Map each insight here to your objectives in your mid review discussion.*
+- **ML models (Random Forest, SVM, ANN) generally do not beat random guessing for daily up/down prediction, even with advanced features.**
+- **Similar results across S&P 500, Nifty 50, FTSE 100, and Bovespa highlight this is not just a U.S./Europe phenomenon.**
+- **This supports the idea that financial markets are efficient and difficult to predict at short-term horizons.**
+- **The analysis demonstrates the *real-world effect* (or limitation) of ML models in actual investment settings, not just in-sample theory.**
+- **Further work could analyze longer-term prediction, alternative data, or portfolio backtesting.**
+
+#### How does this relate to the research gap?
+- Most prior research focuses on model accuracy, not real decision-making.
+- This dashboard provides **empirical, practical evaluation**, showing what works (and doesn’t) in live-like settings.
 """)
 
 # ===========================
@@ -341,5 +345,6 @@ with tab4:
 - Enables direct model comparison and cross-market benchmarking.
 - Provides honest reporting—essential for academic rigor and real-world applicability.
 
+---
 *Update this text as you finalize your report/presentation!*
 """)
