@@ -9,7 +9,6 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.stattools import acf
-from statsmodels.regression.linear_model import OLS
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -27,6 +26,11 @@ st.sidebar.header("Dashboard Controls")
 market = st.sidebar.selectbox("Select Market", list(markets.keys()), help="Choose which market to analyze.")
 df = pd.read_csv(markets[market])
 ticker = st.sidebar.selectbox("Select Ticker", sorted(df['Ticker'].unique()), help="Choose company to visualize.")
+
+# Ensure 'Date' is datetime
+df['Date'] = pd.to_datetime(df['Date'])
+sample = df[df['Ticker'] == ticker].copy()
+
 # -- For rolling beta, let user select the index ticker if present
 if market == "S&P 500" and 'SPY' in df['Ticker'].unique():
     index_ticker = 'SPY'
@@ -34,7 +38,6 @@ elif market == "Nifty 50" and 'NIFTYBEES.NS' in df['Ticker'].unique():
     index_ticker = 'NIFTYBEES.NS'
 else:
     index_ticker = None
-sample = df[df['Ticker'] == ticker].copy()
 
 st.title("Machine Learning in Finance: Multi-Market Research Dashboard")
 st.markdown("""
@@ -65,11 +68,15 @@ with tab1:
 
     # Interactive date range
     st.write("**B. Interactive Date Range Selection** – Focus on any period.")
-    min_date, max_date = sample['Date'].iloc[0], sample['Date'].iloc[-1]
-    date_range = st.slider("Select Date Range", min_value=pd.to_datetime(min_date), max_value=pd.to_datetime(max_date), 
-                           value=(pd.to_datetime(min_date), pd.to_datetime(max_date)))
-    mask = (pd.to_datetime(sample['Date']) >= date_range[0]) & (pd.to_datetime(sample['Date']) <= date_range[1])
-    selected = sample[mask]
+    min_date, max_date = sample['Date'].min(), sample['Date'].max()
+    date_range = st.slider(
+        "Select Date Range",
+        min_value=min_date,
+        max_value=max_date,
+        value=(min_date, max_date)
+    )
+    mask = (sample['Date'] >= date_range[0]) & (sample['Date'] <= date_range[1])
+    selected = sample[mask].copy()
 
     # Daily return histogram
     st.write("**C. Daily Return Distribution** – Shows market risk/volatility.")
@@ -124,7 +131,7 @@ with tab1:
 
     # Correlation heatmap
     st.write("**H. Correlation Heatmap** – See which features move together.")
-    heatmap_features = ['Close', 'Return', 'SMA_20', 'Volatility_20']
+    heatmap_features = [c for c in ['Close', 'Return', 'SMA_20', 'Volatility_20'] if c in selected.columns]
     corr_data = selected[heatmap_features].dropna().corr()
     fig8, ax8 = plt.subplots()
     sns.heatmap(corr_data, annot=True, fmt=".2f", cmap='coolwarm', ax=ax8)
@@ -205,6 +212,4 @@ with tab1:
 
     st.markdown("> **Interpretation:** This comprehensive EDA suite supports all research objectives, giving you the data depth and analytical tools needed for top-tier finance research.")
 
-# Tab 2, Tab 3, Tab 4 (ML results, interpretation, objectives) remain as in the earlier provided code above!
-# If you want me to append the full code with these, let me know.
-
+# (Leave tabs 2, 3, 4 unchanged from earlier – let me know if you want the full file with those included!)
