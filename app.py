@@ -24,8 +24,8 @@ st.title("Machine Learning in Finance: Multi-Market Research Dashboard")
 st.markdown("""
 **This dashboard is built to support research objectives:**
 - *Assess real-world impact of ML models on investment decisions*
-- *Benchmark and compare Random Forest, SVM, ANN *
-- *Compare developed vs. emerging markets *
+- *Benchmark and compare Random Forest, SVM, ANN*
+- *Compare developed vs. emerging markets*
 """)
 
 tab1, tab2, tab3, tab4 = st.tabs([
