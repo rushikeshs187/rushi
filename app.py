@@ -129,5 +129,4 @@ with tab4:
 - Enables direct model comparison and cross-market benchmarking.
 - Provides honest reporting—essential for academic rigor and real-world applicability.
 
-*Update this text as you finalize your report/presentation!*
 """)
