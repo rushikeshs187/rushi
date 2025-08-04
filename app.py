@@ -23,16 +23,15 @@ sample = df[df['Ticker'] == ticker]
 st.title("Machine Learning in Finance: Multi-Market Research Dashboard")
 st.markdown("""
 **This dashboard is built to support research objectives:**
-- *Assess real-world impact of ML models on investment decisions (Objective 1)*
-- *Benchmark and compare Random Forest, SVM, ANN (Objective 2)*
-- *Compare developed vs. emerging markets (Objective 3)*
-- *Provide transparent, empirical findings—not just theoretical accuracy*
+- *Assess real-world impact of ML models on investment decisions*
+- *Benchmark and compare Random Forest, SVM, ANN *
+- *Compare developed vs. emerging markets *
 """)
 
 tab1, tab2, tab3, tab4 = st.tabs([
-    "1. Data Visualization (Objective 1,3)",
-    "2. ML Model Results (Objective 2,3)",
-    "3. Interpretation (Objectives 1-3)",
+    "1. Data Visualization",
+    "2. ML Model Results ",
+    "3. Interpretation ",
     "4. About & Research Objectives"
 ])
 
