@@ -61,6 +61,8 @@ with tab1:
 
     if sample.empty:
         st.warning("No data available for this ticker. Try another.")
+    elif pd.isna(sample['Date'].min()) or pd.isna(sample['Date'].max()):
+        st.warning("This ticker has no valid date range. Try another ticker.")
     else:
         # Price trend
         st.write("**A. Price Trend**")
@@ -71,8 +73,7 @@ with tab1:
         ax.set_title(f"{ticker} Closing Price")
         st.pyplot(fig)
 
-        # Date range slider
-        st.write("**B. Interactive Date Range Selection**")
+        # Date range slider (safe version)
         min_date, max_date = sample['Date'].min(), sample['Date'].max()
         date_range = st.slider(
             "Select Date Range",
@@ -219,4 +220,4 @@ with tab1:
 
         st.markdown("> **Interpretation:** This comprehensive EDA suite supports all research objectives, giving you the data depth and analytical tools needed for top-tier finance research.")
 
-# Keep your Tab 2 (ML Results), Tab 3 (Interpretation), Tab 4 (Objectives) as in the previous working version.
+# --- Keep the rest of your ML Results, Interpretation, and About tabs as in your last working version ---
