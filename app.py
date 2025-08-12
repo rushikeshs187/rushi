@@ -1,350 +1,379 @@
-import streamlit as st
-import pandas as pd
+import io
+import os
 import numpy as np
+import pandas as pd
+import streamlit as st
 import matplotlib.pyplot as plt
-import seaborn as sns
+
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, classification_report, confusion_matrix
+)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.neural_network import MLPClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.preprocessing import StandardScaler
-from statsmodels.tsa.stattools import acf
-import warnings
+from sklearn.pipeline import Pipeline
+from sklearn.inspection import permutation_importance
 
-warnings.filterwarnings("ignore")
+# ----------------------------
+# Basic setup
+# ----------------------------
+st.set_page_config(page_title="ML in Finance — Multi‑Market Dashboard", layout="wide")
+st.title("ML in Finance — Multi‑Market Dashboard")
+st.caption("S&P 500 · Nifty 50 · FTSE 100 · Bovespa | EDA · Benchmarking · Interpretability | v1.0")
 
-st.set_page_config(page_title="ML in Finance – Research Dashboard", layout="wide")
-
-markets = {
-    'S&P 500': 'sp500_full_features.csv',
-    'Nifty 50': 'nifty50_full_features.csv',
-    'FTSE 100': 'ftse100_full_features.csv',
-    'Bovespa': 'bovespa_full_features.csv'
+DATA_MAP = {
+    "S&P 500": ("sp500_full_data.csv", "sp500_full_features.csv"),
+    "Nifty 50": ("nifty50_full_data.csv", "nifty50_full_features.csv"),
+    "FTSE 100": ("ftse100_full_data.csv", "ftse100_full_features.csv"),
+    "Bovespa": ("bovespa_full_data.csv", "bovespa_full_features.csv"),
 }
 
-st.sidebar.header("Dashboard Controls")
-market = st.sidebar.selectbox("Select Market", list(markets.keys()), help="Choose which market to analyze.")
-df = pd.read_csv(markets[market])
-ticker = st.sidebar.selectbox("Select Ticker", sorted(df['Ticker'].unique()), help="Choose company to visualize.")
+# ----------------------------
+# Utilities
+# ----------------------------
+@st.cache_data
+def load_price_data(csv_path: str) -> pd.DataFrame:
+    """Expected columns: Date, Ticker, Close, High, Low, Open, Volume."""
+    df = pd.read_csv(csv_path)
+    # Robust date parsing
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df[df["Date"].notna()].sort_values("Date")
+    return df
 
-# --- Prepare the sample for EDA ---
-sample = df[df['Ticker'] == ticker].copy()
-sample['Date'] = pd.to_datetime(sample['Date'], errors='coerce')
-sample = sample[sample['Date'].notna()].sort_values('Date')
+@st.cache_data
+def load_feature_data(csv_path: str) -> pd.DataFrame:
+    """Expected columns: Date, Ticker, Close, High, Low, Open, Volume, features..., Target"""
+    df = pd.read_csv(csv_path)
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df[df["Date"].notna()].sort_values(["Ticker", "Date"])
+    return df
 
-# For rolling beta, detect index ticker
-if market == "S&P 500" and 'SPY' in df['Ticker'].unique():
-    index_ticker = 'SPY'
-elif market == "Nifty 50" and 'NIFTYBEES.NS' in df['Ticker'].unique():
-    index_ticker = 'NIFTYBEES.NS'
+def feature_cols(df: pd.DataFrame) -> list:
+    block = {"Date","Ticker","Target","Close","High","Low","Open","Volume"}
+    return [c for c in df.columns if c not in block and df[c].dtype != "O"]
+
+def train_benchmark_models(df_feat: pd.DataFrame, ticker_sel: list | None = None):
+    # Filter by tickers if provided
+    work = df_feat.copy()
+    if ticker_sel:
+        work = work[work["Ticker"].isin(ticker_sel)].copy()
+    # Drop any rows without target
+    work = work.dropna(subset=["Target"])
+    feats = feature_cols(work)
+    if not feats:
+        return None, "No feature columns found."
+
+    # TimeSeries split by date
+    work = work.sort_values("Date")
+    X = work[feats].values
+    y = work["Target"].astype(int).values
+
+    # Use last 25% as test (simple split)
+    split_idx = int(len(work) * 0.75)
+    if split_idx == 0 or split_idx >= len(work)-1:
+        return None, "Not enough rows to split train/test."
+
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+
+    results = []
+    extras = {}
+
+    # 1) Random Forest
+    rf = RandomForestClassifier(
+        n_estimators=300, max_depth=None, min_samples_leaf=2,
+        random_state=42, n_jobs=-1
+    )
+    rf.fit(X_train, y_train)
+    y_pred_rf = rf.predict(X_test)
+    results.append(("RandomForest",
+                    accuracy_score(y_test, y_pred_rf),
+                    precision_score(y_test, y_pred_rf, zero_division=0),
+                    recall_score(y_test, y_pred_rf, zero_division=0),
+                    f1_score(y_test, y_pred_rf, zero_division=0)))
+    extras["rf_conf"] = confusion_matrix(y_test, y_pred_rf)
+    extras["rf_importance"] = (feats, rf.feature_importances_)
+
+    # 2) SVM (scaled)
+    svm = Pipeline([
+        ("scaler", StandardScaler()),
+        ("svc", SVC(kernel="rbf", C=1.0, gamma="scale", probability=False, random_state=42)),
+    ])
+    svm.fit(X_train, y_train)
+    y_pred_svm = svm.predict(X_test)
+    results.append(("SVM",
+                    accuracy_score(y_test, y_pred_svm),
+                    precision_score(y_test, y_pred_svm, zero_division=0),
+                    recall_score(y_test, y_pred_svm, zero_division=0),
+                    f1_score(y_test, y_pred_svm, zero_division=0)))
+    extras["svm_conf"] = confusion_matrix(y_test, y_pred_svm)
+
+    # Permutation importance for SVM (costly but informative; subsample to speed up)
+    try:
+        sample_idx = np.linspace(0, len(X_test)-1, min(1000, len(X_test)), dtype=int)
+        perm = permutation_importance(
+            svm, X_test[sample_idx], y_test[sample_idx],
+            n_repeats=5, random_state=42, n_jobs=-1
+        )
+        extras["svm_perm"] = (feats, perm.importances_mean)
+    except Exception:
+        extras["svm_perm"] = None
+
+    # 3) ANN / MLP (scaled)
+    mlp = Pipeline([
+        ("scaler", StandardScaler()),
+        ("mlp", MLPClassifier(hidden_layer_sizes=(64, 32), activation="relu",
+                              max_iter=300, random_state=42))
+    ])
+    mlp.fit(X_train, y_train)
+    y_pred_mlp = mlp.predict(X_test)
+    results.append(("ANN",
+                    accuracy_score(y_test, y_pred_mlp),
+                    precision_score(y_test, y_pred_mlp, zero_division=0),
+                    recall_score(y_test, y_pred_mlp, zero_division=0),
+                    f1_score(y_test, y_pred_mlp, zero_division=0)))
+    extras["mlp_conf"] = confusion_matrix(y_test, y_pred_mlp)
+
+    # Pack result table
+    res_df = pd.DataFrame(results, columns=["Model","Accuracy","Precision","Recall","F1"])
+    res_df = res_df.sort_values("Accuracy", ascending=False).reset_index(drop=True)
+    return (res_df, extras, (y_test, {"RF":y_pred_rf,"SVM":y_pred_svm,"ANN":y_pred_mlp})), None
+
+def fig_to_bytes(fig) -> bytes:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    buf.seek(0)
+    return buf.getvalue()
+
+# ----------------------------
+# Sidebar
+# ----------------------------
+st.sidebar.header("Controls")
+market = st.sidebar.selectbox("Market", list(DATA_MAP.keys()))
+price_csv, feat_csv = DATA_MAP[market]
+
+if not os.path.exists(price_csv) or not os.path.exists(feat_csv):
+    st.error(f"Missing files for {market}. Expected:\n- {price_csv}\n- {feat_csv}")
+    st.stop()
+
+# Load data
+price_df = load_price_data(price_csv)
+feat_df  = load_feature_data(feat_csv)
+
+# Global ticker selection (shared by tabs)
+tickers = sorted(price_df["Ticker"].dropna().unique().tolist())
+sel_tickers = st.sidebar.multiselect("Tickers (optional subset)", tickers, default=[])
+
+# Date range filter for EDA
+min_d, max_d = price_df["Date"].min(), price_df["Date"].max()
+date_range = st.sidebar.date_input(
+    "EDA date range",
+    value=(pd.to_datetime(min_d).date(), pd.to_datetime(max_d).date()),
+    min_value=pd.to_datetime(min_d).date(),
+    max_value=pd.to_datetime(max_d).date()
+)
+if isinstance(date_range, tuple):
+    d0, d1 = [pd.to_datetime(x) for x in date_range]
 else:
-    index_ticker = None
+    d0, d1 = pd.to_datetime(min_d), pd.to_datetime(max_d)
 
-st.title("Machine Learning in Finance: Multi-Market Research Dashboard")
-st.markdown("""
-**This dashboard is built to support research objectives:**
-- *Assess real-world impact of ML models on investment decisions (Objective 1)*
-- *Benchmark and compare Random Forest, SVM, ANN (Objective 2)*
-- *Compare developed vs. emerging markets (Objective 3)*
-- *Provide transparent, empirical findings—not just theoretical accuracy*
-""")
-
+# Tabs
 tab1, tab2, tab3, tab4 = st.tabs([
-    "1. Data Visualization (Objective 1,3)",
-    "2. ML Model Results (Objective 2,3)",
-    "3. Interpretation (Objectives 1-3)",
-    "4. About & Research Objectives"
+    "Data Visualization (EDA)",
+    "ML Model Results",
+    "Cross‑Market Compare",
+    "About & Research Objectives"
 ])
 
-# ===========================
-# EDA TAB (tab1)
-# ===========================
+# ----------------------------
+# TAB 1 — EDA
+# ----------------------------
 with tab1:
-    st.header(f"EDA for {ticker} in {market}")
+    st.subheader(f"Exploratory Data Analysis — {market}")
+    eda = price_df.copy()
+    if sel_tickers:
+        eda = eda[eda["Ticker"].isin(sel_tickers)]
+    eda = eda[(eda["Date"]>=d0) & (eda["Date"]<=d1)]
 
-    if sample.empty:
-        st.warning("No data available for this ticker. Try another.")
-    else:
-        # Date slider - bulletproof!
-        min_date_raw, max_date_raw = sample['Date'].min(), sample['Date'].max()
-        if pd.isnull(min_date_raw) or pd.isnull(max_date_raw):
-            st.warning("This ticker has no valid date range. Try another ticker.")
-        else:
-            min_date = pd.to_datetime(min_date_raw).to_pydatetime()
-            max_date = pd.to_datetime(max_date_raw).to_pydatetime()
+    if eda.empty:
+        st.info("No rows in the selected date range / tickers.")
+        st.stop()
 
-            # Price trend
-            st.write("**A. Price Trend**")
-            fig, ax = plt.subplots()
-            ax.plot(sample['Date'], sample['Close'], color='navy')
-            ax.set_xlabel("Date")
-            ax.set_ylabel("Close")
-            ax.set_title(f"{ticker} Closing Price")
-            st.pyplot(fig)
+    t_opt = st.selectbox("Choose one ticker for charts", sorted(eda["Ticker"].unique().tolist()))
+    sub = eda[eda["Ticker"]==t_opt].sort_values("Date").copy()
 
-            date_range = st.slider(
-                "Select Date Range",
-                min_value=min_date,
-                max_value=max_date,
-                value=(min_date, max_date)
-            )
-            mask = (sample['Date'] >= date_range[0]) & (sample['Date'] <= date_range[1])
-            selected = sample[mask].copy()
+    # 1) Price + 20‑day SMA
+    sub["SMA20"] = sub["Close"].rolling(20).mean()
+    fig, ax = plt.subplots(figsize=(10,4))
+    ax.plot(sub["Date"], sub["Close"], label="Close")
+    ax.plot(sub["Date"], sub["SMA20"], label="SMA(20)")
+    ax.set_title(f"{t_opt}: Close vs 20‑Day SMA")
+    ax.set_xlabel("Date"); ax.set_ylabel("Price")
+    ax.legend()
+    st.pyplot(fig)
+    st.caption("SMA smooths price; crossovers often signal momentum shifts.")
 
-            # Daily return histogram
-            st.write("**C. Daily Return Distribution**")
-            fig2, ax2 = plt.subplots()
-            ax2.hist(selected['Return'].dropna(), bins=50, color='teal')
-            ax2.set_xlabel("Return")
-            ax2.set_ylabel("Frequency")
-            st.pyplot(fig2)
+    # 2) Daily Return Distribution
+    sub["Return"] = sub["Close"].pct_change()
+    fig2, ax2 = plt.subplots(figsize=(6,4))
+    ax2.hist(sub["Return"].dropna(), bins=50)
+    ax2.set_title(f"{t_opt}: Daily Return Distribution")
+    ax2.set_xlabel("Daily Return"); ax2.set_ylabel("Frequency")
+    st.pyplot(fig2)
+    st.caption("Shows asymmetry and tails in returns; useful for risk awareness beyond the mean.")
 
-            # SMA
-            st.write("**D. 20-Day SMA vs Close**")
-            fig3, ax3 = plt.subplots()
-            ax3.plot(selected['Date'], selected['Close'], label='Close', color='navy')
-            if 'SMA_20' in selected.columns:
-                ax3.plot(selected['Date'], selected['SMA_20'], label='SMA 20', color='orange')
-            ax3.legend()
-            st.pyplot(fig3)
+    # 3) 20‑day rolling volatility
+    sub["Vol20"] = sub["Return"].rolling(20).std() * np.sqrt(252)
+    fig3, ax3 = plt.subplots(figsize=(10,3))
+    ax3.plot(sub["Date"], sub["Vol20"])
+    ax3.set_title(f"{t_opt}: 20‑Day Rolling Volatility (annualized)")
+    ax3.set_xlabel("Date"); ax3.set_ylabel("Volatility")
+    st.pyplot(fig3)
+    st.caption("Rising volatility usually coincides with uncertainty/regime shifts (risk management).")
 
-            # Volatility
-            st.write("**E. Volatility (20-Day Rolling Std)**")
-            if 'Volatility_20' in selected.columns:
-                fig4, ax4 = plt.subplots()
-                ax4.plot(selected['Date'], selected['Volatility_20'], color='red')
-                ax4.set_xlabel("Date")
-                ax4.set_ylabel("Volatility")
-                st.pyplot(fig4)
+    # 4) Correlation heatmap (Close → pct_change, wide pivot)
+    st.markdown("**Correlation (returns) across selected tickers**")
+    corr_df = eda.pivot(index="Date", columns="Ticker", values="Close").pct_change()
+    corr = corr_df.corr().fillna(0)
+    fig4, ax4 = plt.subplots(figsize=(6,5))
+    im = ax4.imshow(corr.values, aspect="auto")
+    ax4.set_xticks(range(len(corr.columns))); ax4.set_xticklabels(corr.columns, rotation=90)
+    ax4.set_yticks(range(len(corr.index)));  ax4.set_yticklabels(corr.index)
+    ax4.set_title("Correlation Heatmap (Daily Returns)")
+    fig4.colorbar(im, ax=ax4, fraction=0.046, pad=0.04)
+    st.pyplot(fig4)
+    st.caption("Helps spot co‑movement/clustered risk; useful for diversification.")
 
-            # Rolling mean/vol window
-            st.write("**F. Rolling Mean & Volatility**")
-            window = st.slider("Rolling window (days)", min_value=5, max_value=100, value=20, step=5)
-            selected['Rolling_Mean'] = selected['Close'].rolling(window).mean()
-            selected['Rolling_Vol'] = selected['Return'].rolling(window).std()
-            fig5, ax5 = plt.subplots()
-            ax5.plot(selected['Date'], selected['Close'], label='Close', color='navy')
-            ax5.plot(selected['Date'], selected['Rolling_Mean'], label=f'Rolling Mean ({window}d)', color='green')
-            ax5.legend()
-            st.pyplot(fig5)
-            fig6, ax6 = plt.subplots()
-            ax6.plot(selected['Date'], selected['Rolling_Vol'], color='crimson')
-            ax6.set_xlabel("Date")
-            ax6.set_ylabel(f"Volatility ({window}d std of returns)")
-            st.pyplot(fig6)
-
-            # Cumulative returns
-            st.write("**G. Cumulative Returns**")
-            selected['Cumulative'] = (1 + selected['Return'].fillna(0)).cumprod()
-            fig7, ax7 = plt.subplots()
-            ax7.plot(selected['Date'], selected['Cumulative'], color='purple')
-            ax7.set_xlabel("Date")
-            ax7.set_ylabel("Cumulative Growth ($1 baseline)")
-            st.pyplot(fig7)
-
-            # Correlation heatmap
-            st.write("**H. Correlation Heatmap**")
-            heatmap_features = [c for c in ['Close', 'Return', 'SMA_20', 'Volatility_20'] if c in selected.columns]
-            if len(heatmap_features) >= 2:
-                corr_data = selected[heatmap_features].dropna().corr()
-                fig8, ax8 = plt.subplots()
-                sns.heatmap(corr_data, annot=True, fmt=".2f", cmap='coolwarm', ax=ax8)
-                st.pyplot(fig8)
-            else:
-                st.info("Not enough features for correlation heatmap.")
-
-            # Outlier detection
-            st.write("**I. Outlier Detection**")
-            if 'Return' in selected.columns:
-                ups = selected.nlargest(5, 'Return')[['Date', 'Return']]
-                downs = selected.nsmallest(5, 'Return')[['Date', 'Return']]
-                st.write("Top 5 Positive Return Days:")
-                st.table(ups)
-                st.write("Top 5 Negative Return Days:")
-                st.table(downs)
-
-            # Drawdown plot
-            st.write("**J. Drawdown Plot**")
-            if 'Close' in selected.columns:
-                running_max = selected['Close'].cummax()
-                drawdown = (selected['Close'] - running_max) / running_max
-                fig9, ax9 = plt.subplots()
-                ax9.plot(selected['Date'], drawdown, color='brown')
-                ax9.set_xlabel("Date")
-                ax9.set_ylabel("Drawdown (relative)")
-                st.pyplot(fig9)
-
-            # Risk-return scatter
-            st.write("**K. Risk-Return Scatterplot**")
-            if 'Return' in df.columns:
-                means = df.groupby('Ticker')['Return'].mean()
-                stds = df.groupby('Ticker')['Return'].std()
-                fig10, ax10 = plt.subplots()
-                ax10.scatter(stds, means, alpha=0.7)
-                ax10.set_xlabel("Volatility (std)")
-                ax10.set_ylabel("Mean Return")
-                ax10.set_title("Risk-Return by Ticker")
-                for tick in means.index:
-                    ax10.annotate(tick, (stds[tick], means[tick]), fontsize=7, alpha=0.7)
-                st.pyplot(fig10)
-
-            # Rolling beta to index (if possible)
-            if index_ticker and ticker != index_ticker and 'Return' in selected.columns:
-                st.write(f"**L. Rolling Beta to Index ({index_ticker})**")
-                ticker_returns = selected.set_index('Date')['Return']
-                index_returns = df[df['Ticker'] == index_ticker].set_index('Date')['Return'].reindex(selected['Date'])
-                beta_win = st.slider("Beta window (days)", min_value=20, max_value=120, value=60, step=10)
-                betas = []
-                for i in range(len(ticker_returns)):
-                    if i < beta_win: betas.append(np.nan); continue
-                    y = ticker_returns.iloc[i-beta_win:i].values
-                    x = index_returns.iloc[i-beta_win:i].values
-                    if np.isnan(y).any() or np.isnan(x).any(): betas.append(np.nan); continue
-                    beta = np.polyfit(x, y, 1)[0]
-                    betas.append(beta)
-                fig11, ax11 = plt.subplots()
-                ax11.plot(selected['Date'], betas, color='darkorange')
-                ax11.set_xlabel("Date")
-                ax11.set_ylabel(f"Beta (window={beta_win})")
-                st.pyplot(fig11)
-
-            # Autocorrelation plot
-            st.write("**M. Autocorrelation of Returns**")
-            if 'Return' in selected.columns:
-                acf_lags = st.slider("Autocorrelation lags", min_value=5, max_value=60, value=20, step=5)
-                acf_vals = acf(selected['Return'].dropna(), nlags=acf_lags)
-                fig12, ax12 = plt.subplots()
-                ax12.bar(range(acf_lags+1), acf_vals, color='dodgerblue')
-                ax12.set_xlabel("Lag")
-                ax12.set_ylabel("Autocorrelation")
-                ax12.set_title("Autocorrelation of Returns")
-                st.pyplot(fig12)
-
-            # Missing data
-            st.write("**N. Missing Data Check**")
-            missing = selected.isnull().astype(int)
-            st.dataframe(missing.sum().reset_index().rename(columns={0:'MissingCount'}))
-
-            st.markdown("> **Interpretation:** This comprehensive EDA suite supports all research objectives, giving you the data depth and analytical tools needed for top-tier finance research.")
-
-# ===========================
-# ML MODEL RESULTS TAB (tab2)
-# ===========================
+# ----------------------------
+# TAB 2 — ML Model Results
+# ----------------------------
 with tab2:
-    st.header(f"Model Benchmarking for All Markets")
-    st.info("Click the button below to automatically run RandomForest, SVM, and ANN on each market. Results will appear in the table and can be downloaded for your report.")
+    st.subheader(f"Model Benchmarking — {market}")
+    st.write("Models: RandomForest, SVM (RBF), ANN/MLP. Target assumed as classification label in *_full_features.csv.")
+    if sel_tickers:
+        st.caption(f"Training on selected tickers only: {', '.join(sel_tickers)}")
 
-    if st.button("Run All ML Benchmarks"):
-        results = []
-        progress = st.progress(0)
-        for i, (mkt, file) in enumerate(markets.items()):
-            dfm = pd.read_csv(file)
-            dfm['Date'] = pd.to_datetime(dfm['Date'], errors='coerce')
-            dfm = dfm[dfm['Date'].notna()]
-            dfm['Return_1d_ago'] = dfm.groupby('Ticker')['Return'].shift(1)
-            dfm['Return_5d_ago'] = dfm.groupby('Ticker')['Return'].shift(5)
-            dfm['SMA_50'] = dfm.groupby('Ticker')['Close'].transform(lambda x: x.rolling(window=50).mean())
-            dfm['Target'] = (dfm.groupby('Ticker')['Return'].shift(-1) > 0).astype(int)
-            dfm = dfm.dropna(subset=['Return', 'Return_1d_ago', 'Return_5d_ago', 'SMA_20', 'SMA_50', 'Volatility_20', 'Target'])
-            features = ['Return', 'Return_1d_ago', 'Return_5d_ago', 'SMA_20', 'SMA_50', 'Volatility_20']
-            X = dfm[features]
-            y = dfm['Target']
-            train = dfm[dfm['Date'] < '2023-01-01']
-            test = dfm[dfm['Date'] >= '2023-01-01']
-            X_train = train[features]; y_train = train['Target']
-            X_test = test[features]; y_test = test['Target']
+    with st.spinner("Training & evaluating models…"):
+        outcome = train_benchmark_models(feat_df, sel_tickers if sel_tickers else None)
 
-            # RandomForest
-            model_rf = RandomForestClassifier(n_estimators=100, random_state=42)
-            model_rf.fit(X_train, y_train)
-            y_pred_rf = model_rf.predict(X_test)
-            results.append({
-                'Market': mkt, 'Model': 'RandomForest',
-                'Accuracy': accuracy_score(y_test, y_pred_rf),
-                'Precision': precision_score(y_test, y_pred_rf, zero_division=0),
-                'Recall': recall_score(y_test, y_pred_rf, zero_division=0),
-                'F1': f1_score(y_test, y_pred_rf, zero_division=0)})
-
-            # SVM
-            model_svm = SVC()
-            model_svm.fit(X_train, y_train)
-            y_pred_svm = model_svm.predict(X_test)
-            results.append({
-                'Market': mkt, 'Model': 'SVM',
-                'Accuracy': accuracy_score(y_test, y_pred_svm),
-                'Precision': precision_score(y_test, y_pred_svm, zero_division=0),
-                'Recall': recall_score(y_test, y_pred_svm, zero_division=0),
-                'F1': f1_score(y_test, y_pred_svm, zero_division=0)})
-
-            # ANN
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_test_scaled = scaler.transform(X_test)
-            model_ann = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=200, random_state=42)
-            model_ann.fit(X_train_scaled, y_train)
-            y_pred_ann = model_ann.predict(X_test_scaled)
-            results.append({
-                'Market': mkt, 'Model': 'ANN',
-                'Accuracy': accuracy_score(y_test, y_pred_ann),
-                'Precision': precision_score(y_test, y_pred_ann, zero_division=0),
-                'Recall': recall_score(y_test, y_pred_ann, zero_division=0),
-                'F1': f1_score(y_test, y_pred_ann, zero_division=0)})
-
-            progress.progress((i+1)/len(markets))
-
-        resdf = pd.DataFrame(results)
-        st.dataframe(resdf)
-        st.download_button("Download Results as CSV", resdf.to_csv(index=False), file_name="ml_model_results.csv")
-        st.success("Benchmarks complete! Results table updated. These results are directly relevant to Objective 2 (model comparison) and Objective 3 (market benchmarking).")
-
+    if outcome[1] is not None:
+        st.error(outcome[1])
     else:
-        st.info("Click 'Run All ML Benchmarks' to benchmark RandomForest, SVM, ANN for all markets and display results here. You can also download the summary.")
+        (res_df, extras, (y_test, preds)) = outcome[0]
+        st.dataframe(res_df, use_container_width=True)
 
-    st.write("""
-    - **Interpretation**: Live benchmarking addresses the research gap on comparative model performance (Objective 2) and enables easy cross-market analysis (Objective 3).
-    - **No manual file uploads required – everything runs and appears instantly!**
-    """)
+        # Download results
+        csv_bytes = res_df.to_csv(index=False).encode()
+        st.download_button("Download results (CSV)", csv_bytes, file_name=f"{market.replace(' ','_').lower()}_model_results.csv")
 
-# ===========================
-# INTERPRETATION TAB (tab3)
-# ===========================
+        # Confusion matrices
+        colc1, colc2, colc3 = st.columns(3)
+        for name, cm, col in [
+            ("RandomForest", extras["rf_conf"], colc1),
+            ("SVM",          extras["svm_conf"], colc2),
+            ("ANN",          extras["mlp_conf"], colc3),
+        ]:
+            with col:
+                fig, ax = plt.subplots(figsize=(3.5,3.2))
+                im = ax.imshow(cm, cmap="Blues")
+                ax.set_title(f"{name} — Confusion Matrix")
+                ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
+                for (i,j), v in np.ndenumerate(cm):
+                    ax.text(j, i, int(v), ha='center', va='center')
+                st.pyplot(fig)
+
+        # Feature importance / permutation importance
+        st.markdown("### Interpretability")
+        rf_feats, rf_imp = extras["rf_importance"]
+        imp_rf = pd.DataFrame({"Feature": rf_feats, "Importance": rf_imp}).sort_values("Importance", ascending=False).head(15)
+        st.write("**RandomForest — Top Features**")
+        st.dataframe(imp_rf, use_container_width=True)
+        figi, axi = plt.subplots(figsize=(6,4))
+        axi.barh(imp_rf["Feature"][::-1], imp_rf["Importance"][::-1])
+        axi.set_title("RandomForest Feature Importance (Top 15)")
+        st.pyplot(figi)
+
+        st.write("**SVM — Permutation Importance (Top 15)**")
+        if extras["svm_perm"] is not None:
+            svm_feats, svm_imp = extras["svm_perm"]
+            imp_svm = pd.DataFrame({"Feature": svm_feats, "Importance": svm_imp}).sort_values("Importance", ascending=False).head(15)
+            st.dataframe(imp_svm, use_container_width=True)
+            figp, axp = plt.subplots(figsize=(6,4))
+            axp.barh(imp_svm["Feature"][::-1], imp_svm["Importance"][::-1])
+            axp.set_title("SVM Permutation Importance (Top 15)")
+            st.pyplot(figp)
+        else:
+            st.info("Permutation importance for SVM not available (insufficient data or pipeline constraints).")
+
+        # Light narrative
+        best_row = res_df.iloc[0]
+        st.markdown(
+            f"""**Quick take:** On this sample split, **{best_row['Model']}** performs best by accuracy
+            ({best_row['Accuracy']:.3f}). Feature ranking above helps interpret what drives signals —
+            key for Objective 1 (practical decision impact) & Objective 2 (model traits)."""
+        )
+
+# ----------------------------
+# TAB 3 — Cross‑Market Compare
+# ----------------------------
 with tab3:
-    st.header("Cross-Market and Cross-Model Insights")
-    st.markdown("""
-### Main Takeaways:
+    st.subheader("Cross‑Market Comparison")
+    st.caption("Runs a fast benchmark on all markets with the same settings to compare headline metrics.")
 
-- **ML models (Random Forest, SVM, ANN) generally do not beat random guessing for daily up/down prediction, even with advanced features.**
-- **Similar results across S&P 500, Nifty 50, FTSE 100, and Bovespa highlight this is not just a U.S./Europe phenomenon.**
-- **This supports the idea that financial markets are efficient and difficult to predict at short-term horizons.**
-- **The analysis demonstrates the *real-world effect* (or limitation) of ML models in actual investment settings, not just in-sample theory.**
-- **Further work could analyze longer-term prediction, alternative data, or portfolio backtesting.**
+    if st.button("Run cross‑market benchmark"):
+        rows = []
+        for mkt, (pcsv, fcsv) in DATA_MAP.items():
+            try:
+                fdf = load_feature_data(fcsv)
+                out = train_benchmark_models(fdf, sel_tickers if sel_tickers else None)
+                if out[1] is None:
+                    res = out[0][0]
+                    res["Market"] = mkt
+                    rows.append(res)
+            except Exception as e:
+                st.warning(f"{mkt}: {e}")
+        if rows:
+            allres = pd.concat(rows, ignore_index=True)
+            allres = allres[["Market","Model","Accuracy","Precision","Recall","F1"]]
+            st.dataframe(allres, use_container_width=True)
 
-#### How does this relate to the research gap?
-- Most prior research focuses on model accuracy, not real decision-making.
-- This dashboard provides **empirical, practical evaluation**, showing what works (and doesn’t) in live-like settings.
-""")
+            # Simple compare plot
+            figc, axc = plt.subplots(figsize=(9,4))
+            for mkt in allres["Market"].unique():
+                sub = allres[allres["Market"]==mkt]
+                axc.plot(sub["Model"], sub["Accuracy"], marker="o", label=mkt)
+            axc.set_ylabel("Accuracy"); axc.set_title("Accuracy by Model across Markets")
+            axc.legend()
+            st.pyplot(figc)
 
-# ===========================
-# ABOUT & OBJECTIVES TAB (tab4)
-# ===========================
+            st.download_button(
+                "Download cross‑market results (CSV)",
+                allres.to_csv(index=False).encode(),
+                file_name="cross_market_results.csv"
+            )
+        else:
+            st.info("No results computed.")
+
+# ----------------------------
+# TAB 4 — About & Research Objectives
+# ----------------------------
 with tab4:
-    st.header("About this Research & Dashboard")
-    st.markdown("""
-#### **Research Gaps**
-1. Most academic ML-in-finance research focuses on accuracy, not practical decision impact.
-2. Few studies compare multiple ML models (RF, SVM, ANN) for real investment strategies.
-3. Prior work is heavily U.S./Europe-centric; emerging markets get little attention.
+    st.subheader("About this Project")
+    st.write("""
+This dashboard supports the thesis **“Machine Learning applications in Finance”** by operationalising the three objectives:
 
-#### **Objectives**
-1. **Assess real-world effect of ML models** on investment/portfolio decisions (asset selection, risk management).
-2. **Benchmark and compare** RF, SVM, ANN for investment-related prediction.
-3. **Explore ML in emerging markets** (Nifty 50, Bovespa, etc.) and contrast with developed ones.
+- **Objective 1 — Real‑world effect:** We translate model predictions into investment‑relevant signals (classification of next‑day move) and show risk views (volatility) in EDA.
+- **Objective 2 — Model compatibility & traits:** We benchmark **RF, SVM, ANN** on identical data and expose **confusion matrices** and **feature/permutation importance**.
+- **Objective 3 — Emerging vs developed markets:** The **Cross‑Market** tab lets you contrast performance across S&P 500, Nifty 50, FTSE 100, and Bovespa.
 
-#### **How this dashboard supports the objectives:**
-- Shows how features and models work for practical investment tasks (not just theory).
-- Enables direct model comparison and cross-market benchmarking.
-- Provides honest reporting—essential for academic rigor and real-world applicability.
+**Data expectations**  
+`*_full_data.csv` contain OHLCV by Date & Ticker.  
+`*_full_features.csv` contain engineered features plus a binary `Target` column.
 
----
-*Update this text as you finalize your report/presentation!*
+> Tip: keep engineered features consistent across markets so comparisons remain fair.
 """)
