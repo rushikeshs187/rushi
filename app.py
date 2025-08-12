@@ -1,379 +1,483 @@
+# app.py
+# Streamlit ML-in-Finance Dashboard (IBR)
+# Author: Rushikesh N. Shinde (MGB) — all-in-one app for data, models, and backtest
+
 import io
-import os
+import sys
+import time
+import math
 import numpy as np
 import pandas as pd
-import streamlit as st
-import matplotlib.pyplot as plt
+from datetime import timedelta
 
-from sklearn.model_selection import TimeSeriesSplit
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score,
-    f1_score, classification_report, confusion_matrix
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, confusion_matrix, classification_report
 )
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.neural_network import MLPClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.inspection import permutation_importance
 
-# ----------------------------
-# Basic setup
-# ----------------------------
-st.set_page_config(page_title="ML in Finance — Multi‑Market Dashboard", layout="wide")
-st.title("ML in Finance — Multi‑Market Dashboard")
-st.caption("S&P 500 · Nifty 50 · FTSE 100 · Bovespa | EDA · Benchmarking · Interpretability | v1.0")
+# =============== Page Config ===============
+st.set_page_config(
+    page_title="ML in Finance — Dashboard",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-DATA_MAP = {
-    "S&P 500": ("sp500_full_data.csv", "sp500_full_features.csv"),
-    "Nifty 50": ("nifty50_full_data.csv", "nifty50_full_features.csv"),
-    "FTSE 100": ("ftse100_full_data.csv", "ftse100_full_features.csv"),
-    "Bovespa": ("bovespa_full_data.csv", "bovespa_full_features.csv"),
-}
-
-# ----------------------------
-# Utilities
-# ----------------------------
+# =============== Utils ===============
 @st.cache_data
-def load_price_data(csv_path: str) -> pd.DataFrame:
-    """Expected columns: Date, Ticker, Close, High, Low, Open, Volume."""
-    df = pd.read_csv(csv_path)
-    # Robust date parsing
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df[df["Date"].notna()].sort_values("Date")
+def load_csv(file) -> pd.DataFrame:
+    df = pd.read_csv(file)
     return df
 
-@st.cache_data
-def load_feature_data(csv_path: str) -> pd.DataFrame:
-    """Expected columns: Date, Ticker, Close, High, Low, Open, Volume, features..., Target"""
-    df = pd.read_csv(csv_path)
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df[df["Date"].notna()].sort_values(["Ticker", "Date"])
+def ensure_datetime_index(df: pd.DataFrame, date_col: str = "Date") -> pd.DataFrame:
+    if date_col in df.columns:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=False)
+        df = df.dropna(subset=[date_col]).sort_values(date_col)
+        df = df.set_index(date_col)
+    else:
+        # If no date col, try index
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("No 'Date' column and index is not DatetimeIndex.")
+        df = df.sort_index()
     return df
 
-def feature_cols(df: pd.DataFrame) -> list:
-    block = {"Date","Ticker","Target","Close","High","Low","Open","Volume"}
-    return [c for c in df.columns if c not in block and df[c].dtype != "O"]
+def to_returns(series: pd.Series) -> pd.Series:
+    return series.pct_change().fillna(0.0)
 
-def train_benchmark_models(df_feat: pd.DataFrame, ticker_sel: list | None = None):
-    # Filter by tickers if provided
-    work = df_feat.copy()
-    if ticker_sel:
-        work = work[work["Ticker"].isin(ticker_sel)].copy()
-    # Drop any rows without target
-    work = work.dropna(subset=["Target"])
-    feats = feature_cols(work)
-    if not feats:
-        return None, "No feature columns found."
+def rolling_max_drawdown(equity: pd.Series) -> float:
+    roll_max = equity.cummax()
+    dd = equity/roll_max - 1.0
+    return dd.min()
 
-    # TimeSeries split by date
-    work = work.sort_values("Date")
-    X = work[feats].values
-    y = work["Target"].astype(int).values
+def sharpe_ratio(returns: pd.Series, rf: float = 0.0, periods_per_year: int = 252) -> float:
+    # rf is annual risk-free rate; convert to per-period
+    if returns.std() == 0:
+        return 0.0
+    mean = returns.mean()
+    std = returns.std()
+    sr = (mean - rf/periods_per_year) / std * np.sqrt(periods_per_year)
+    return float(sr)
 
-    # Use last 25% as test (simple split)
-    split_idx = int(len(work) * 0.75)
-    if split_idx == 0 or split_idx >= len(work)-1:
-        return None, "Not enough rows to split train/test."
+def sortino_ratio(returns: pd.Series, rf: float = 0.0, periods_per_year: int = 252) -> float:
+    downside = returns[returns < 0]
+    if downside.std() == 0:
+        return np.inf
+    mean = returns.mean()
+    dd = downside.std()
+    return float((mean - rf/periods_per_year) / dd * np.sqrt(periods_per_year))
 
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
+def safe_clip_prob(p: np.ndarray) -> np.ndarray:
+    return np.clip(p, 1e-6, 1-1e-6)
 
-    results = []
-    extras = {}
+def make_demo_data(n=1200, seed=42):
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2018-01-01", periods=n)
+    # Geometric random walk for price
+    rets = rng.normal(loc=0.0004, scale=0.012, size=n)
+    price = 100 * (1 + pd.Series(rets, index=dates)).cumprod()
+    vol = (rng.normal(1_000_000, 150_000, size=n)).clip(50_000, None)
+    df = pd.DataFrame({"Date": dates, "Close": price.values, "Volume": vol})
+    return df
 
-    # 1) Random Forest
-    rf = RandomForestClassifier(
-        n_estimators=300, max_depth=None, min_samples_leaf=2,
-        random_state=42, n_jobs=-1
+def add_technical_features(df: pd.DataFrame, price_col: str = "Close") -> pd.DataFrame:
+    out = df.copy()
+    px = out[price_col].astype(float)
+
+    # Returns and lagged returns
+    out["ret_1"] = px.pct_change()
+    out["ret_5"] = px.pct_change(5)
+    out["ret_10"] = px.pct_change(10)
+
+    # Moving averages
+    out["sma_5"] = px.rolling(5).mean()
+    out["sma_10"] = px.rolling(10).mean()
+    out["sma_20"] = px.rolling(20).mean()
+    out["ema_10"] = px.ewm(span=10, adjust=False).mean()
+    out["ema_20"] = px.ewm(span=20, adjust=False).mean()
+
+    # Momentum / Oscillators
+    out["mom_10"] = px.pct_change(10)
+    # RSI(14)
+    delta = px.diff()
+    up = delta.clip(lower=0).rolling(14).mean()
+    down = -delta.clip(upper=0).rolling(14).mean()
+    rs = up / (down + 1e-9)
+    out["rsi_14"] = 100 - (100 / (1 + rs))
+
+    # Volatility
+    out["vol_10"] = out["ret_1"].rolling(10).std()
+    out["vol_20"] = out["ret_1"].rolling(20).std()
+
+    # Price position vs bands (simple %B style)
+    ma20 = out["sma_20"]
+    sd20 = px.rolling(20).std()
+    upper = ma20 + 2*sd20
+    lower = ma20 - 2*sd20
+    out["pctB"] = (px - lower) / (upper - lower + 1e-9)
+
+    # Volume features (if available)
+    if "Volume" in out.columns:
+        vol = out["Volume"].astype(float)
+        out["vol_chg_1"] = vol.pct_change()
+        out["vol_sma_10"] = vol.rolling(10).mean()
+
+    return out
+
+def create_target(df: pd.DataFrame, price_col: str = "Close", horizon: int = 5, threshold: float = 0.0) -> pd.Series:
+    """
+    Binary target: 1 if forward % return over 'horizon' days > threshold, else 0.
+    """
+    fwd_ret = df[price_col].shift(-horizon) / df[price_col] - 1.0
+    target = (fwd_ret > threshold).astype(int)
+    return target
+
+def timeseries_train_val_test_split(df, train_size=0.6, val_size=0.2):
+    n = len(df)
+    n_train = int(n * train_size)
+    n_val = int(n * val_size)
+    train = df.iloc[:n_train].copy()
+    val = df.iloc[n_train:n_train+n_val].copy()
+    test = df.iloc[n_train+n_val:].copy()
+    return train, val, test
+
+def prepare_Xy(df: pd.DataFrame, feature_cols, target_col: str):
+    work = df.copy()
+    work = work.dropna(subset=feature_cols + [target_col])
+    X = work[feature_cols].values
+    y = work[target_col].values.astype(int)
+    idx = work.index
+    return X, y, idx
+
+def backtest_equity_curve(prices: pd.Series, signal: pd.Series, threshold: float = 0.5, prob: pd.Series | None = None):
+    """
+    Simple daily strategy:
+    - Long when signal==1 (or prob>=threshold), else in cash (0).
+    - No short for simplicity.
+    """
+    if prob is not None:
+        pos = (prob >= threshold).astype(int)
+    else:
+        pos = (signal > 0).astype(int)
+    # Daily returns
+    rets = prices.pct_change().fillna(0.0)
+    strat_rets = rets * pos.shift(1).fillna(0)  # enter next day to avoid lookahead
+    equity = (1 + strat_rets).cumprod()
+    return strat_rets, equity
+
+def plot_price(df, price_col="Close", title="Price"):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df[price_col], mode="lines", name=price_col))
+    fig.update_layout(height=350, margin=dict(l=10, r=10, t=30, b=10), title=title)
+    return fig
+
+def plot_equity(equity: pd.Series, title="Strategy Equity Curve"):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=equity.index, y=equity.values, mode="lines", name="Equity"))
+    fig.update_layout(height=350, margin=dict(l=10, r=10, t=30, b=10), title=title)
+    return fig
+
+def plot_predictions(df, price_col="Close", proba=None, preds=None, title="Predictions vs Price"):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df[price_col], mode="lines", name="Price"))
+    if proba is not None:
+        fig.add_trace(go.Scatter(x=df.index, y=proba, mode="lines", name="Pred Prob(Up)", yaxis="y2", opacity=0.6))
+    fig.update_layout(
+        height=380,
+        margin=dict(l=10, r=10, t=30, b=10),
+        title=title,
+        yaxis=dict(title="Price"),
+        yaxis2=dict(title="Prob Up", overlaying="y", side="right", range=[0,1]),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
-    rf.fit(X_train, y_train)
-    y_pred_rf = rf.predict(X_test)
-    results.append(("RandomForest",
-                    accuracy_score(y_test, y_pred_rf),
-                    precision_score(y_test, y_pred_rf, zero_division=0),
-                    recall_score(y_test, y_pred_rf, zero_division=0),
-                    f1_score(y_test, y_pred_rf, zero_division=0)))
-    extras["rf_conf"] = confusion_matrix(y_test, y_pred_rf)
-    extras["rf_importance"] = (feats, rf.feature_importances_)
+    return fig
 
-    # 2) SVM (scaled)
-    svm = Pipeline([
-        ("scaler", StandardScaler()),
-        ("svc", SVC(kernel="rbf", C=1.0, gamma="scale", probability=False, random_state=42)),
-    ])
-    svm.fit(X_train, y_train)
-    y_pred_svm = svm.predict(X_test)
-    results.append(("SVM",
-                    accuracy_score(y_test, y_pred_svm),
-                    precision_score(y_test, y_pred_svm, zero_division=0),
-                    recall_score(y_test, y_pred_svm, zero_division=0),
-                    f1_score(y_test, y_pred_svm, zero_division=0)))
-    extras["svm_conf"] = confusion_matrix(y_test, y_pred_svm)
+# =============== Sidebar Controls ===============
+st.sidebar.header("⚙️ Controls")
+st.sidebar.markdown("Configure data, features, target and models.")
 
-    # Permutation importance for SVM (costly but informative; subsample to speed up)
+with st.sidebar.expander("Data Input", expanded=True):
+    uploaded = st.file_uploader("Upload CSV (with at least Date & Close). Optional Volume column.", type=["csv"])
+    demo = st.checkbox("Use demo data if no file", value=True)
+    date_col = st.text_input("Date column name", value="Date")
+    price_col = st.text_input("Price column name", value="Close")
+
+with st.sidebar.expander("Target (Label)", expanded=True):
+    horizon = st.number_input("Forward horizon (days)", min_value=1, max_value=60, value=5, step=1)
+    threshold = st.number_input("Return threshold for label (e.g., 0.0)", min_value=-1.0, max_value=1.0, value=0.0, step=0.01)
+    ensure_label = st.checkbox("Create/overwrite Target automatically", value=True)
+
+with st.sidebar.expander("Train / Val / Test Split", expanded=False):
+    tr_size = st.slider("Train size", 0.4, 0.8, 0.6, 0.05)
+    va_size = st.slider("Validation size", 0.1, 0.4, 0.2, 0.05)
+
+with st.sidebar.expander("Models", expanded=True):
+    model_choices = st.multiselect(
+        "Select models to train",
+        ["RandomForest", "SVM-RBF", "MLP"],
+        default=["RandomForest", "SVM-RBF", "MLP"]
+    )
+    prob_threshold = st.slider("Prob. threshold for trading", 0.1, 0.9, 0.5, 0.05)
+
+with st.sidebar.expander("Advanced", expanded=False):
+    dropna_tail = st.checkbox("Strictly drop tail rows with NaNs", value=True)
+    scale_features = st.checkbox("Standardize features", value=True)
+    risk_free = st.number_input("Annual risk-free rate (for ratios)", min_value=0.0, max_value=0.2, value=0.02, step=0.005)
+
+# =============== Main ===============
+st.title("📊 Machine Learning Applications in Finance — Interactive Dashboard")
+
+# --- Data Loading ---
+if uploaded is not None:
     try:
-        sample_idx = np.linspace(0, len(X_test)-1, min(1000, len(X_test)), dtype=int)
-        perm = permutation_importance(
-            svm, X_test[sample_idx], y_test[sample_idx],
-            n_repeats=5, random_state=42, n_jobs=-1
-        )
-        extras["svm_perm"] = (feats, perm.importances_mean)
-    except Exception:
-        extras["svm_perm"] = None
-
-    # 3) ANN / MLP (scaled)
-    mlp = Pipeline([
-        ("scaler", StandardScaler()),
-        ("mlp", MLPClassifier(hidden_layer_sizes=(64, 32), activation="relu",
-                              max_iter=300, random_state=42))
-    ])
-    mlp.fit(X_train, y_train)
-    y_pred_mlp = mlp.predict(X_test)
-    results.append(("ANN",
-                    accuracy_score(y_test, y_pred_mlp),
-                    precision_score(y_test, y_pred_mlp, zero_division=0),
-                    recall_score(y_test, y_pred_mlp, zero_division=0),
-                    f1_score(y_test, y_pred_mlp, zero_division=0)))
-    extras["mlp_conf"] = confusion_matrix(y_test, y_pred_mlp)
-
-    # Pack result table
-    res_df = pd.DataFrame(results, columns=["Model","Accuracy","Precision","Recall","F1"])
-    res_df = res_df.sort_values("Accuracy", ascending=False).reset_index(drop=True)
-    return (res_df, extras, (y_test, {"RF":y_pred_rf,"SVM":y_pred_svm,"ANN":y_pred_mlp})), None
-
-def fig_to_bytes(fig) -> bytes:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
-    buf.seek(0)
-    return buf.getvalue()
-
-# ----------------------------
-# Sidebar
-# ----------------------------
-st.sidebar.header("Controls")
-market = st.sidebar.selectbox("Market", list(DATA_MAP.keys()))
-price_csv, feat_csv = DATA_MAP[market]
-
-if not os.path.exists(price_csv) or not os.path.exists(feat_csv):
-    st.error(f"Missing files for {market}. Expected:\n- {price_csv}\n- {feat_csv}")
+        df_raw = load_csv(uploaded)
+    except Exception as e:
+        st.error(f"Failed to read CSV: {e}")
+        st.stop()
+elif demo:
+    df_raw = make_demo_data()
+    st.info("Demo data generated (synthetic daily series). Upload a CSV to use real data.")
+else:
+    st.warning("Please upload a CSV or enable demo data.")
     st.stop()
 
-# Load data
-price_df = load_price_data(price_csv)
-feat_df  = load_feature_data(feat_csv)
+# Ensure date index
+try:
+    df = ensure_datetime_index(df_raw.copy(), date_col=date_col)
+except Exception as e:
+    st.error(f"Date handling error: {e}")
+    st.stop()
 
-# Global ticker selection (shared by tabs)
-tickers = sorted(price_df["Ticker"].dropna().unique().tolist())
-sel_tickers = st.sidebar.multiselect("Tickers (optional subset)", tickers, default=[])
+# Basic sanity checks
+if price_col not in df.columns:
+    st.error(f"Price column '{price_col}' not found in data.")
+    st.stop()
 
-# Date range filter for EDA
-min_d, max_d = price_df["Date"].min(), price_df["Date"].max()
-date_range = st.sidebar.date_input(
-    "EDA date range",
-    value=(pd.to_datetime(min_d).date(), pd.to_datetime(max_d).date()),
-    min_value=pd.to_datetime(min_d).date(),
-    max_value=pd.to_datetime(max_d).date()
-)
-if isinstance(date_range, tuple):
-    d0, d1 = [pd.to_datetime(x) for x in date_range]
-else:
-    d0, d1 = pd.to_datetime(min_d), pd.to_datetime(max_d)
+# --- Feature Engineering & Target ---
+work = add_technical_features(df, price_col=price_col)
 
-# Tabs
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Data Visualization (EDA)",
-    "ML Model Results",
-    "Cross‑Market Compare",
-    "About & Research Objectives"
-])
+# Prepare Target
+if ensure_label or ("Target" not in work.columns):
+    work["Target"] = create_target(work, price_col=price_col, horizon=horizon, threshold=threshold)
 
-# ----------------------------
-# TAB 1 — EDA
-# ----------------------------
-with tab1:
-    st.subheader(f"Exploratory Data Analysis — {market}")
-    eda = price_df.copy()
-    if sel_tickers:
-        eda = eda[eda["Ticker"].isin(sel_tickers)]
-    eda = eda[(eda["Date"]>=d0) & (eda["Date"]<=d1)]
+# Drop last 'horizon' rows where forward label is undefined
+if dropna_tail:
+    work = work.iloc[:-horizon] if len(work) > horizon else work.iloc[:0]
 
-    if eda.empty:
-        st.info("No rows in the selected date range / tickers.")
-        st.stop()
+# Feature set
+candidate_features = [
+    "ret_1","ret_5","ret_10",
+    "sma_5","sma_10","sma_20","ema_10","ema_20",
+    "mom_10","rsi_14","vol_10","vol_20","pctB",
+    "vol_chg_1","vol_sma_10"
+]
+feature_cols = [c for c in candidate_features if c in work.columns]
 
-    t_opt = st.selectbox("Choose one ticker for charts", sorted(eda["Ticker"].unique().tolist()))
-    sub = eda[eda["Ticker"]==t_opt].sort_values("Date").copy()
+with st.expander("🔎 Data Preview & Feature Engineering", expanded=False):
+    st.write("First rows (post features/label):")
+    st.dataframe(work.head(20))
+    st.caption(f"Features used ({len(feature_cols)}): {feature_cols}")
 
-    # 1) Price + 20‑day SMA
-    sub["SMA20"] = sub["Close"].rolling(20).mean()
-    fig, ax = plt.subplots(figsize=(10,4))
-    ax.plot(sub["Date"], sub["Close"], label="Close")
-    ax.plot(sub["Date"], sub["SMA20"], label="SMA(20)")
-    ax.set_title(f"{t_opt}: Close vs 20‑Day SMA")
-    ax.set_xlabel("Date"); ax.set_ylabel("Price")
-    ax.legend()
-    st.pyplot(fig)
-    st.caption("SMA smooths price; crossovers often signal momentum shifts.")
+# Handle NaNs from rolling calculations
+work = work.replace([np.inf, -np.inf], np.nan)
+work = work.dropna(subset=[price_col, "Target"] + feature_cols)
 
-    # 2) Daily Return Distribution
-    sub["Return"] = sub["Close"].pct_change()
-    fig2, ax2 = plt.subplots(figsize=(6,4))
-    ax2.hist(sub["Return"].dropna(), bins=50)
-    ax2.set_title(f"{t_opt}: Daily Return Distribution")
-    ax2.set_xlabel("Daily Return"); ax2.set_ylabel("Frequency")
-    st.pyplot(fig2)
-    st.caption("Shows asymmetry and tails in returns; useful for risk awareness beyond the mean.")
+if work.empty or work["Target"].nunique() < 2:
+    st.error("Not enough labeled data after preprocessing (need both classes 0/1). Adjust horizon/threshold or provide more data.")
+    st.stop()
 
-    # 3) 20‑day rolling volatility
-    sub["Vol20"] = sub["Return"].rolling(20).std() * np.sqrt(252)
-    fig3, ax3 = plt.subplots(figsize=(10,3))
-    ax3.plot(sub["Date"], sub["Vol20"])
-    ax3.set_title(f"{t_opt}: 20‑Day Rolling Volatility (annualized)")
-    ax3.set_xlabel("Date"); ax3.set_ylabel("Volatility")
-    st.pyplot(fig3)
-    st.caption("Rising volatility usually coincides with uncertainty/regime shifts (risk management).")
+# --- Split ---
+train_df, val_df, test_df = timeseries_train_val_test_split(work, train_size=tr_size, val_size=va_size)
+st.subheader("🔪 Time-Aware Split")
+c1, c2, c3 = st.columns(3)
+c1.metric("Train rows", len(train_df))
+c2.metric("Validation rows", len(val_df))
+c3.metric("Test rows", len(test_df))
+st.caption(f"Train: {train_df.index.min().date()} → {train_df.index.max().date()} | "
+           f"Val: {val_df.index.min().date()} → {val_df.index.max().date()} | "
+           f"Test: {test_df.index.min().date()} → {test_df.index.max().date()}")
 
-    # 4) Correlation heatmap (Close → pct_change, wide pivot)
-    st.markdown("**Correlation (returns) across selected tickers**")
-    corr_df = eda.pivot(index="Date", columns="Ticker", values="Close").pct_change()
-    corr = corr_df.corr().fillna(0)
-    fig4, ax4 = plt.subplots(figsize=(6,5))
-    im = ax4.imshow(corr.values, aspect="auto")
-    ax4.set_xticks(range(len(corr.columns))); ax4.set_xticklabels(corr.columns, rotation=90)
-    ax4.set_yticks(range(len(corr.index)));  ax4.set_yticklabels(corr.index)
-    ax4.set_title("Correlation Heatmap (Daily Returns)")
-    fig4.colorbar(im, ax=ax4, fraction=0.046, pad=0.04)
-    st.pyplot(fig4)
-    st.caption("Helps spot co‑movement/clustered risk; useful for diversification.")
+# Prepare X/y
+X_train, y_train, idx_train = prepare_Xy(train_df, feature_cols, "Target")
+X_val, y_val, idx_val = prepare_Xy(val_df, feature_cols, "Target")
+X_test, y_test, idx_test = prepare_Xy(test_df, feature_cols, "Target")
 
-# ----------------------------
-# TAB 2 — ML Model Results
-# ----------------------------
-with tab2:
-    st.subheader(f"Model Benchmarking — {market}")
-    st.write("Models: RandomForest, SVM (RBF), ANN/MLP. Target assumed as classification label in *_full_features.csv.")
-    if sel_tickers:
-        st.caption(f"Training on selected tickers only: {', '.join(sel_tickers)}")
+# Scale
+scaler = None
+if scale_features:
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val = scaler.transform(X_val)
+    X_test = scaler.transform(X_test)
 
-    with st.spinner("Training & evaluating models…"):
-        outcome = train_benchmark_models(feat_df, sel_tickers if sel_tickers else None)
+# =============== Model Training ===============
+st.subheader("🤖 Models & Evaluation")
 
-    if outcome[1] is not None:
-        st.error(outcome[1])
-    else:
-        (res_df, extras, (y_test, preds)) = outcome[0]
-        st.dataframe(res_df, use_container_width=True)
-
-        # Download results
-        csv_bytes = res_df.to_csv(index=False).encode()
-        st.download_button("Download results (CSV)", csv_bytes, file_name=f"{market.replace(' ','_').lower()}_model_results.csv")
-
-        # Confusion matrices
-        colc1, colc2, colc3 = st.columns(3)
-        for name, cm, col in [
-            ("RandomForest", extras["rf_conf"], colc1),
-            ("SVM",          extras["svm_conf"], colc2),
-            ("ANN",          extras["mlp_conf"], colc3),
-        ]:
-            with col:
-                fig, ax = plt.subplots(figsize=(3.5,3.2))
-                im = ax.imshow(cm, cmap="Blues")
-                ax.set_title(f"{name} — Confusion Matrix")
-                ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
-                for (i,j), v in np.ndenumerate(cm):
-                    ax.text(j, i, int(v), ha='center', va='center')
-                st.pyplot(fig)
-
-        # Feature importance / permutation importance
-        st.markdown("### Interpretability")
-        rf_feats, rf_imp = extras["rf_importance"]
-        imp_rf = pd.DataFrame({"Feature": rf_feats, "Importance": rf_imp}).sort_values("Importance", ascending=False).head(15)
-        st.write("**RandomForest — Top Features**")
-        st.dataframe(imp_rf, use_container_width=True)
-        figi, axi = plt.subplots(figsize=(6,4))
-        axi.barh(imp_rf["Feature"][::-1], imp_rf["Importance"][::-1])
-        axi.set_title("RandomForest Feature Importance (Top 15)")
-        st.pyplot(figi)
-
-        st.write("**SVM — Permutation Importance (Top 15)**")
-        if extras["svm_perm"] is not None:
-            svm_feats, svm_imp = extras["svm_perm"]
-            imp_svm = pd.DataFrame({"Feature": svm_feats, "Importance": svm_imp}).sort_values("Importance", ascending=False).head(15)
-            st.dataframe(imp_svm, use_container_width=True)
-            figp, axp = plt.subplots(figsize=(6,4))
-            axp.barh(imp_svm["Feature"][::-1], imp_svm["Importance"][::-1])
-            axp.set_title("SVM Permutation Importance (Top 15)")
-            st.pyplot(figp)
-        else:
-            st.info("Permutation importance for SVM not available (insufficient data or pipeline constraints).")
-
-        # Light narrative
-        best_row = res_df.iloc[0]
-        st.markdown(
-            f"""**Quick take:** On this sample split, **{best_row['Model']}** performs best by accuracy
-            ({best_row['Accuracy']:.3f}). Feature ranking above helps interpret what drives signals —
-            key for Objective 1 (practical decision impact) & Objective 2 (model traits)."""
+def train_model(name: str):
+    if name == "RandomForest":
+        clf = RandomForestClassifier(
+            n_estimators=300, max_depth=None, min_samples_leaf=2,
+            random_state=42, n_jobs=-1, class_weight="balanced_subsample"
         )
+        supports_proba = True
+    elif name == "SVM-RBF":
+        clf = SVC(kernel="rbf", C=2.0, gamma="scale", probability=True, random_state=42)
+        supports_proba = True
+    elif name == "MLP":
+        clf = MLPClassifier(hidden_layer_sizes=(64,32), activation="relu",
+                            alpha=1e-4, learning_rate_init=1e-3, max_iter=300,
+                            random_state=42, shuffle=False, early_stopping=True,
+                            n_iter_no_change=15, validation_fraction=0.15)
+        supports_proba = True
+    else:
+        raise ValueError("Unknown model.")
+    clf.fit(X_train, y_train)
+    return clf, supports_proba
 
-# ----------------------------
-# TAB 3 — Cross‑Market Compare
-# ----------------------------
-with tab3:
-    st.subheader("Cross‑Market Comparison")
-    st.caption("Runs a fast benchmark on all markets with the same settings to compare headline metrics.")
+results = []
+tabs = st.tabs(model_choices if model_choices else ["No Model Selected"])
 
-    if st.button("Run cross‑market benchmark"):
-        rows = []
-        for mkt, (pcsv, fcsv) in DATA_MAP.items():
+for tab, name in zip(tabs, model_choices):
+    with tab:
+        with st.spinner(f"Training {name}..."):
+            clf, supports_proba = train_model(name)
+
+        # Validation eval
+        val_pred = clf.predict(X_val)
+        val_proba = clf.predict_proba(X_val)[:,1] if supports_proba else None
+
+        test_pred = clf.predict(X_test)
+        test_proba = clf.predict_proba(X_test)[:,1] if supports_proba else None
+
+        # Metrics
+        def metrics_block(y_true, y_hat, y_prob, label="Val"):
+            acc = accuracy_score(y_true, y_hat)
+            prec = precision_score(y_true, y_hat, zero_division=0)
+            rec = recall_score(y_true, y_hat, zero_division=0)
+            f1 = f1_score(y_true, y_hat, zero_division=0)
             try:
-                fdf = load_feature_data(fcsv)
-                out = train_benchmark_models(fdf, sel_tickers if sel_tickers else None)
-                if out[1] is None:
-                    res = out[0][0]
-                    res["Market"] = mkt
-                    rows.append(res)
-            except Exception as e:
-                st.warning(f"{mkt}: {e}")
-        if rows:
-            allres = pd.concat(rows, ignore_index=True)
-            allres = allres[["Market","Model","Accuracy","Precision","Recall","F1"]]
-            st.dataframe(allres, use_container_width=True)
+                auc = roc_auc_score(y_true, y_prob) if y_prob is not None else np.nan
+            except ValueError:
+                auc = np.nan
+            st.write(f"**{label} Metrics**")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Accuracy", f"{acc:.3f}")
+            m2.metric("Precision", f"{prec:.3f}")
+            m3.metric("Recall", f"{rec:.3f}")
+            m4.metric("F1", f"{f1:.3f}")
+            m5.metric("ROC AUC", f"{auc:.3f}" if not math.isnan(auc) else "n/a")
+            return acc, prec, rec, f1, auc
 
-            # Simple compare plot
-            figc, axc = plt.subplots(figsize=(9,4))
-            for mkt in allres["Market"].unique():
-                sub = allres[allres["Market"]==mkt]
-                axc.plot(sub["Model"], sub["Accuracy"], marker="o", label=mkt)
-            axc.set_ylabel("Accuracy"); axc.set_title("Accuracy by Model across Markets")
-            axc.legend()
-            st.pyplot(figc)
+        st.markdown("### Validation")
+        v_acc, v_prec, v_rec, v_f1, v_auc = metrics_block(y_val, val_pred, val_proba, "Validation")
 
-            st.download_button(
-                "Download cross‑market results (CSV)",
-                allres.to_csv(index=False).encode(),
-                file_name="cross_market_results.csv"
-            )
+        st.markdown("### Test")
+        t_acc, t_prec, t_rec, t_f1, t_auc = metrics_block(y_test, test_pred, test_proba, "Test")
+
+        # Confusion matrix (Test)
+        cm = confusion_matrix(y_test, test_pred)
+        cm_fig = px.imshow(cm, text_auto=True, color_continuous_scale="Blues",
+                           labels=dict(x="Pred", y="True", color="Count"),
+                           x=["Down(0)", "Up(1)"], y=["Down(0)", "Up(1)"])
+        cm_fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10), title="Confusion Matrix (Test)")
+        st.plotly_chart(cm_fig, use_container_width=True)
+
+        # Predictions plot on Test
+        test_frame = test_df.loc[idx_test].copy()
+        if test_proba is not None:
+            fig_pred = plot_predictions(test_frame, price_col=price_col, proba=test_proba, title=f"{name}: Price & Prob(Up) — Test")
         else:
-            st.info("No results computed.")
+            fig_pred = plot_price(test_frame, price_col=price_col, title=f"{name}: Price — Test")
+        st.plotly_chart(fig_pred, use_container_width=True)
 
-# ----------------------------
-# TAB 4 — About & Research Objectives
-# ----------------------------
-with tab4:
-    st.subheader("About this Project")
-    st.write("""
-This dashboard supports the thesis **“Machine Learning applications in Finance”** by operationalising the three objectives:
+        # Backtest on Test
+        prices_test = test_frame[price_col]
+        if test_proba is not None:
+            strat_rets, equity = backtest_equity_curve(prices_test, pd.Series(test_pred, index=idx_test),
+                                                       threshold=prob_threshold, prob=pd.Series(test_proba, index=idx_test))
+        else:
+            strat_rets, equity = backtest_equity_curve(prices_test, pd.Series(test_pred, index=idx_test))
 
-- **Objective 1 — Real‑world effect:** We translate model predictions into investment‑relevant signals (classification of next‑day move) and show risk views (volatility) in EDA.
-- **Objective 2 — Model compatibility & traits:** We benchmark **RF, SVM, ANN** on identical data and expose **confusion matrices** and **feature/permutation importance**.
-- **Objective 3 — Emerging vs developed markets:** The **Cross‑Market** tab lets you contrast performance across S&P 500, Nifty 50, FTSE 100, and Bovespa.
+        bt_c1, bt_c2, bt_c3, bt_c4 = st.columns(4)
+        bt_c1.metric("CAGR (approx)", f"{(equity.iloc[-1]**(252/len(equity)) - 1):.2%}" if len(equity)>0 else "n/a")
+        bt_c2.metric("Sharpe", f"{sharpe_ratio(strat_rets, rf=risk_free):.2f}")
+        bt_c3.metric("Sortino", f"{sortino_ratio(strat_rets, rf=risk_free):.2f}")
+        bt_c4.metric("Max Drawdown", f"{rolling_max_drawdown(equity):.2%}")
 
-**Data expectations**  
-`*_full_data.csv` contain OHLCV by Date & Ticker.  
-`*_full_features.csv` contain engineered features plus a binary `Target` column.
+        st.plotly_chart(plot_equity(equity, title=f"{name}: Strategy Equity (Test)"), use_container_width=True)
 
-> Tip: keep engineered features consistent across markets so comparisons remain fair.
-""")
+        # Save for comparison table
+        results.append({
+            "Model": name,
+            "Val_Acc": v_acc, "Val_F1": v_f1, "Val_AUC": v_auc,
+            "Test_Acc": t_acc, "Test_F1": t_f1, "Test_AUC": t_auc,
+            "Test_Sharpe": sharpe_ratio(strat_rets, rf=risk_free),
+            "Test_Sortino": sortino_ratio(strat_rets, rf=risk_free),
+            "Test_MDD": rolling_max_drawdown(equity),
+            "Test_CAGR_est": (equity.iloc[-1]**(252/len(equity)) - 1) if len(equity)>0 else np.nan
+        })
+
+# =============== Comparison ===============
+if results:
+    st.subheader("📌 Model Comparison (Validation & Test)")
+    comp = pd.DataFrame(results)
+    st.dataframe(
+        comp.set_index("Model").style.format({
+            "Val_Acc":"{:.3f}", "Val_F1":"{:.3f}", "Val_AUC":"{:.3f}",
+            "Test_Acc":"{:.3f}", "Test_F1":"{:.3f}", "Test_AUC":"{:.3f}",
+            "Test_Sharpe":"{:.2f}", "Test_Sortino":"{:.2f}",
+            "Test_MDD":"{:.2%}", "Test_CAGR_est":"{:.2%}"
+        }),
+        use_container_width=True
+    )
+
+# =============== Raw Charts ===============
+st.subheader("📈 Price Chart")
+st.plotly_chart(plot_price(work, price_col=price_col, title="Close Price"), use_container_width=True)
+
+# =============== Download Section ===============
+st.subheader("⬇️ Exports")
+# Processed dataset
+processed_csv = work.reset_index().rename(columns={"index":"Date"}).to_csv(index=False).encode("utf-8")
+st.download_button(
+    "Download processed dataset (CSV)",
+    data=processed_csv,
+    file_name="processed_features_labels.csv",
+    mime="text/csv"
+)
+
+# Comparison table
+if results:
+    comp_csv = pd.DataFrame(results).to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download model comparison (CSV)",
+        data=comp_csv,
+        file_name="model_comparison.csv",
+        mime="text/csv"
+    )
+
+# =============== Template Helper ===============
+with st.expander("📄 CSV Template (click to download)"):
+    template = pd.DataFrame({
+        "Date": pd.date_range("2022-01-03", periods=30, freq="B"),
+        "Close": np.linspace(100, 110, 30),
+        "Volume": np.random.randint(100000, 200000, 30)
+    })
+    buf = io.StringIO()
+    template.to_csv(buf, index=False)
+    st.download_button(
+        "Download minimal template",
+        data=buf.getvalue().encode("utf-8"),
+        file_name="price_data_template.csv",
+        mime="text/csv"
+    )
+
+st.caption("Tip: Label = 1 if future return over the chosen horizon exceeds threshold; else 0. Strategy goes long when predicted probability ≥ threshold (no short).")
