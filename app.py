@@ -1,483 +1,502 @@
 # app.py
-# Streamlit ML-in-Finance Dashboard (IBR)
-# Author: Rushikesh N. Shinde (MGB) — all-in-one app for data, models, and backtest
-
+import os
 import io
 import sys
-import time
-import math
+import glob
+import warnings
+warnings.filterwarnings("ignore")
+
 import numpy as np
 import pandas as pd
-from datetime import timedelta
-
-import streamlit as st
-import plotly.graph_objects as go
 import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
 
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, confusion_matrix, classification_report
-)
-from sklearn.preprocessing import StandardScaler
+# ML
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
-from sklearn.neural_network import MLPClassifier
 
-# =============== Page Config ===============
-st.set_page_config(
-    page_title="ML in Finance — Dashboard",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# =============== Utils ===============
-@st.cache_data
-def load_csv(file) -> pd.DataFrame:
-    df = pd.read_csv(file)
-    return df
-
-def ensure_datetime_index(df: pd.DataFrame, date_col: str = "Date") -> pd.DataFrame:
-    if date_col in df.columns:
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=False)
-        df = df.dropna(subset=[date_col]).sort_values(date_col)
-        df = df.set_index(date_col)
-    else:
-        # If no date col, try index
-        if not isinstance(df.index, pd.DatetimeIndex):
-            raise ValueError("No 'Date' column and index is not DatetimeIndex.")
-        df = df.sort_index()
-    return df
-
-def to_returns(series: pd.Series) -> pd.Series:
-    return series.pct_change().fillna(0.0)
-
-def rolling_max_drawdown(equity: pd.Series) -> float:
-    roll_max = equity.cummax()
-    dd = equity/roll_max - 1.0
-    return dd.min()
-
-def sharpe_ratio(returns: pd.Series, rf: float = 0.0, periods_per_year: int = 252) -> float:
-    # rf is annual risk-free rate; convert to per-period
-    if returns.std() == 0:
-        return 0.0
-    mean = returns.mean()
-    std = returns.std()
-    sr = (mean - rf/periods_per_year) / std * np.sqrt(periods_per_year)
-    return float(sr)
-
-def sortino_ratio(returns: pd.Series, rf: float = 0.0, periods_per_year: int = 252) -> float:
-    downside = returns[returns < 0]
-    if downside.std() == 0:
-        return np.inf
-    mean = returns.mean()
-    dd = downside.std()
-    return float((mean - rf/periods_per_year) / dd * np.sqrt(periods_per_year))
-
-def safe_clip_prob(p: np.ndarray) -> np.ndarray:
-    return np.clip(p, 1e-6, 1-1e-6)
-
-def make_demo_data(n=1200, seed=42):
-    rng = np.random.default_rng(seed)
-    dates = pd.bdate_range("2018-01-01", periods=n)
-    # Geometric random walk for price
-    rets = rng.normal(loc=0.0004, scale=0.012, size=n)
-    price = 100 * (1 + pd.Series(rets, index=dates)).cumprod()
-    vol = (rng.normal(1_000_000, 150_000, size=n)).clip(50_000, None)
-    df = pd.DataFrame({"Date": dates, "Close": price.values, "Volume": vol})
-    return df
-
-def add_technical_features(df: pd.DataFrame, price_col: str = "Close") -> pd.DataFrame:
-    out = df.copy()
-    px = out[price_col].astype(float)
-
-    # Returns and lagged returns
-    out["ret_1"] = px.pct_change()
-    out["ret_5"] = px.pct_change(5)
-    out["ret_10"] = px.pct_change(10)
-
-    # Moving averages
-    out["sma_5"] = px.rolling(5).mean()
-    out["sma_10"] = px.rolling(10).mean()
-    out["sma_20"] = px.rolling(20).mean()
-    out["ema_10"] = px.ewm(span=10, adjust=False).mean()
-    out["ema_20"] = px.ewm(span=20, adjust=False).mean()
-
-    # Momentum / Oscillators
-    out["mom_10"] = px.pct_change(10)
-    # RSI(14)
-    delta = px.diff()
-    up = delta.clip(lower=0).rolling(14).mean()
-    down = -delta.clip(upper=0).rolling(14).mean()
-    rs = up / (down + 1e-9)
-    out["rsi_14"] = 100 - (100 / (1 + rs))
-
-    # Volatility
-    out["vol_10"] = out["ret_1"].rolling(10).std()
-    out["vol_20"] = out["ret_1"].rolling(20).std()
-
-    # Price position vs bands (simple %B style)
-    ma20 = out["sma_20"]
-    sd20 = px.rolling(20).std()
-    upper = ma20 + 2*sd20
-    lower = ma20 - 2*sd20
-    out["pctB"] = (px - lower) / (upper - lower + 1e-9)
-
-    # Volume features (if available)
-    if "Volume" in out.columns:
-        vol = out["Volume"].astype(float)
-        out["vol_chg_1"] = vol.pct_change()
-        out["vol_sma_10"] = vol.rolling(10).mean()
-
-    return out
-
-def create_target(df: pd.DataFrame, price_col: str = "Close", horizon: int = 5, threshold: float = 0.0) -> pd.Series:
-    """
-    Binary target: 1 if forward % return over 'horizon' days > threshold, else 0.
-    """
-    fwd_ret = df[price_col].shift(-horizon) / df[price_col] - 1.0
-    target = (fwd_ret > threshold).astype(int)
-    return target
-
-def timeseries_train_val_test_split(df, train_size=0.6, val_size=0.2):
-    n = len(df)
-    n_train = int(n * train_size)
-    n_val = int(n * val_size)
-    train = df.iloc[:n_train].copy()
-    val = df.iloc[n_train:n_train+n_val].copy()
-    test = df.iloc[n_train+n_val:].copy()
-    return train, val, test
-
-def prepare_Xy(df: pd.DataFrame, feature_cols, target_col: str):
-    work = df.copy()
-    work = work.dropna(subset=feature_cols + [target_col])
-    X = work[feature_cols].values
-    y = work[target_col].values.astype(int)
-    idx = work.index
-    return X, y, idx
-
-def backtest_equity_curve(prices: pd.Series, signal: pd.Series, threshold: float = 0.5, prob: pd.Series | None = None):
-    """
-    Simple daily strategy:
-    - Long when signal==1 (or prob>=threshold), else in cash (0).
-    - No short for simplicity.
-    """
-    if prob is not None:
-        pos = (prob >= threshold).astype(int)
-    else:
-        pos = (signal > 0).astype(int)
-    # Daily returns
-    rets = prices.pct_change().fillna(0.0)
-    strat_rets = rets * pos.shift(1).fillna(0)  # enter next day to avoid lookahead
-    equity = (1 + strat_rets).cumprod()
-    return strat_rets, equity
-
-def plot_price(df, price_col="Close", title="Price"):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df.index, y=df[price_col], mode="lines", name=price_col))
-    fig.update_layout(height=350, margin=dict(l=10, r=10, t=30, b=10), title=title)
-    return fig
-
-def plot_equity(equity: pd.Series, title="Strategy Equity Curve"):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=equity.index, y=equity.values, mode="lines", name="Equity"))
-    fig.update_layout(height=350, margin=dict(l=10, r=10, t=30, b=10), title=title)
-    return fig
-
-def plot_predictions(df, price_col="Close", proba=None, preds=None, title="Predictions vs Price"):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df.index, y=df[price_col], mode="lines", name="Price"))
-    if proba is not None:
-        fig.add_trace(go.Scatter(x=df.index, y=proba, mode="lines", name="Pred Prob(Up)", yaxis="y2", opacity=0.6))
-    fig.update_layout(
-        height=380,
-        margin=dict(l=10, r=10, t=30, b=10),
-        title=title,
-        yaxis=dict(title="Price"),
-        yaxis2=dict(title="Prob Up", overlaying="y", side="right", range=[0,1]),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    return fig
-
-# =============== Sidebar Controls ===============
-st.sidebar.header("⚙️ Controls")
-st.sidebar.markdown("Configure data, features, target and models.")
-
-with st.sidebar.expander("Data Input", expanded=True):
-    uploaded = st.file_uploader("Upload CSV (with at least Date & Close). Optional Volume column.", type=["csv"])
-    demo = st.checkbox("Use demo data if no file", value=True)
-    date_col = st.text_input("Date column name", value="Date")
-    price_col = st.text_input("Price column name", value="Close")
-
-with st.sidebar.expander("Target (Label)", expanded=True):
-    horizon = st.number_input("Forward horizon (days)", min_value=1, max_value=60, value=5, step=1)
-    threshold = st.number_input("Return threshold for label (e.g., 0.0)", min_value=-1.0, max_value=1.0, value=0.0, step=0.01)
-    ensure_label = st.checkbox("Create/overwrite Target automatically", value=True)
-
-with st.sidebar.expander("Train / Val / Test Split", expanded=False):
-    tr_size = st.slider("Train size", 0.4, 0.8, 0.6, 0.05)
-    va_size = st.slider("Validation size", 0.1, 0.4, 0.2, 0.05)
-
-with st.sidebar.expander("Models", expanded=True):
-    model_choices = st.multiselect(
-        "Select models to train",
-        ["RandomForest", "SVM-RBF", "MLP"],
-        default=["RandomForest", "SVM-RBF", "MLP"]
-    )
-    prob_threshold = st.slider("Prob. threshold for trading", 0.1, 0.9, 0.5, 0.05)
-
-with st.sidebar.expander("Advanced", expanded=False):
-    dropna_tail = st.checkbox("Strictly drop tail rows with NaNs", value=True)
-    scale_features = st.checkbox("Standardize features", value=True)
-    risk_free = st.number_input("Annual risk-free rate (for ratios)", min_value=0.0, max_value=0.2, value=0.02, step=0.005)
-
-# =============== Main ===============
-st.title("📊 Machine Learning Applications in Finance — Interactive Dashboard")
-
-# --- Data Loading ---
-if uploaded is not None:
-    try:
-        df_raw = load_csv(uploaded)
-    except Exception as e:
-        st.error(f"Failed to read CSV: {e}")
-        st.stop()
-elif demo:
-    df_raw = make_demo_data()
-    st.info("Demo data generated (synthetic daily series). Upload a CSV to use real data.")
-else:
-    st.warning("Please upload a CSV or enable demo data.")
-    st.stop()
-
-# Ensure date index
+# Optional: ANN (safe toggle below)
 try:
-    df = ensure_datetime_index(df_raw.copy(), date_col=date_col)
-except Exception as e:
-    st.error(f"Date handling error: {e}")
-    st.stop()
+    import tensorflow as tf
+    from tensorflow.keras import Sequential
+    from tensorflow.keras.layers import Dense, Dropout
+    TF_OK = True
+except Exception:
+    TF_OK = False
 
-# Basic sanity checks
-if price_col not in df.columns:
-    st.error(f"Price column '{price_col}' not found in data.")
-    st.stop()
 
-# --- Feature Engineering & Target ---
-work = add_technical_features(df, price_col=price_col)
+# ---------------------------
+# App Config
+# ---------------------------
+st.set_page_config(page_title="ML in Finance — Mid Review", layout="wide")
 
-# Prepare Target
-if ensure_label or ("Target" not in work.columns):
-    work["Target"] = create_target(work, price_col=price_col, horizon=horizon, threshold=threshold)
-
-# Drop last 'horizon' rows where forward label is undefined
-if dropna_tail:
-    work = work.iloc[:-horizon] if len(work) > horizon else work.iloc[:0]
-
-# Feature set
-candidate_features = [
-    "ret_1","ret_5","ret_10",
-    "sma_5","sma_10","sma_20","ema_10","ema_20",
-    "mom_10","rsi_14","vol_10","vol_20","pctB",
-    "vol_chg_1","vol_sma_10"
-]
-feature_cols = [c for c in candidate_features if c in work.columns]
-
-with st.expander("🔎 Data Preview & Feature Engineering", expanded=False):
-    st.write("First rows (post features/label):")
-    st.dataframe(work.head(20))
-    st.caption(f"Features used ({len(feature_cols)}): {feature_cols}")
-
-# Handle NaNs from rolling calculations
-work = work.replace([np.inf, -np.inf], np.nan)
-work = work.dropna(subset=[price_col, "Target"] + feature_cols)
-
-if work.empty or work["Target"].nunique() < 2:
-    st.error("Not enough labeled data after preprocessing (need both classes 0/1). Adjust horizon/threshold or provide more data.")
-    st.stop()
-
-# --- Split ---
-train_df, val_df, test_df = timeseries_train_val_test_split(work, train_size=tr_size, val_size=va_size)
-st.subheader("🔪 Time-Aware Split")
-c1, c2, c3 = st.columns(3)
-c1.metric("Train rows", len(train_df))
-c2.metric("Validation rows", len(val_df))
-c3.metric("Test rows", len(test_df))
-st.caption(f"Train: {train_df.index.min().date()} → {train_df.index.max().date()} | "
-           f"Val: {val_df.index.min().date()} → {val_df.index.max().date()} | "
-           f"Test: {test_df.index.min().date()} → {test_df.index.max().date()}")
-
-# Prepare X/y
-X_train, y_train, idx_train = prepare_Xy(train_df, feature_cols, "Target")
-X_val, y_val, idx_val = prepare_Xy(val_df, feature_cols, "Target")
-X_test, y_test, idx_test = prepare_Xy(test_df, feature_cols, "Target")
-
-# Scale
-scaler = None
-if scale_features:
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_val = scaler.transform(X_val)
-    X_test = scaler.transform(X_test)
-
-# =============== Model Training ===============
-st.subheader("🤖 Models & Evaluation")
-
-def train_model(name: str):
-    if name == "RandomForest":
-        clf = RandomForestClassifier(
-            n_estimators=300, max_depth=None, min_samples_leaf=2,
-            random_state=42, n_jobs=-1, class_weight="balanced_subsample"
-        )
-        supports_proba = True
-    elif name == "SVM-RBF":
-        clf = SVC(kernel="rbf", C=2.0, gamma="scale", probability=True, random_state=42)
-        supports_proba = True
-    elif name == "MLP":
-        clf = MLPClassifier(hidden_layer_sizes=(64,32), activation="relu",
-                            alpha=1e-4, learning_rate_init=1e-3, max_iter=300,
-                            random_state=42, shuffle=False, early_stopping=True,
-                            n_iter_no_change=15, validation_fraction=0.15)
-        supports_proba = True
-    else:
-        raise ValueError("Unknown model.")
-    clf.fit(X_train, y_train)
-    return clf, supports_proba
-
-results = []
-tabs = st.tabs(model_choices if model_choices else ["No Model Selected"])
-
-for tab, name in zip(tabs, model_choices):
-    with tab:
-        with st.spinner(f"Training {name}..."):
-            clf, supports_proba = train_model(name)
-
-        # Validation eval
-        val_pred = clf.predict(X_val)
-        val_proba = clf.predict_proba(X_val)[:,1] if supports_proba else None
-
-        test_pred = clf.predict(X_test)
-        test_proba = clf.predict_proba(X_test)[:,1] if supports_proba else None
-
-        # Metrics
-        def metrics_block(y_true, y_hat, y_prob, label="Val"):
-            acc = accuracy_score(y_true, y_hat)
-            prec = precision_score(y_true, y_hat, zero_division=0)
-            rec = recall_score(y_true, y_hat, zero_division=0)
-            f1 = f1_score(y_true, y_hat, zero_division=0)
-            try:
-                auc = roc_auc_score(y_true, y_prob) if y_prob is not None else np.nan
-            except ValueError:
-                auc = np.nan
-            st.write(f"**{label} Metrics**")
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Accuracy", f"{acc:.3f}")
-            m2.metric("Precision", f"{prec:.3f}")
-            m3.metric("Recall", f"{rec:.3f}")
-            m4.metric("F1", f"{f1:.3f}")
-            m5.metric("ROC AUC", f"{auc:.3f}" if not math.isnan(auc) else "n/a")
-            return acc, prec, rec, f1, auc
-
-        st.markdown("### Validation")
-        v_acc, v_prec, v_rec, v_f1, v_auc = metrics_block(y_val, val_pred, val_proba, "Validation")
-
-        st.markdown("### Test")
-        t_acc, t_prec, t_rec, t_f1, t_auc = metrics_block(y_test, test_pred, test_proba, "Test")
-
-        # Confusion matrix (Test)
-        cm = confusion_matrix(y_test, test_pred)
-        cm_fig = px.imshow(cm, text_auto=True, color_continuous_scale="Blues",
-                           labels=dict(x="Pred", y="True", color="Count"),
-                           x=["Down(0)", "Up(1)"], y=["Down(0)", "Up(1)"])
-        cm_fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10), title="Confusion Matrix (Test)")
-        st.plotly_chart(cm_fig, use_container_width=True)
-
-        # Predictions plot on Test
-        test_frame = test_df.loc[idx_test].copy()
-        if test_proba is not None:
-            fig_pred = plot_predictions(test_frame, price_col=price_col, proba=test_proba, title=f"{name}: Price & Prob(Up) — Test")
-        else:
-            fig_pred = plot_price(test_frame, price_col=price_col, title=f"{name}: Price — Test")
-        st.plotly_chart(fig_pred, use_container_width=True)
-
-        # Backtest on Test
-        prices_test = test_frame[price_col]
-        if test_proba is not None:
-            strat_rets, equity = backtest_equity_curve(prices_test, pd.Series(test_pred, index=idx_test),
-                                                       threshold=prob_threshold, prob=pd.Series(test_proba, index=idx_test))
-        else:
-            strat_rets, equity = backtest_equity_curve(prices_test, pd.Series(test_pred, index=idx_test))
-
-        bt_c1, bt_c2, bt_c3, bt_c4 = st.columns(4)
-        bt_c1.metric("CAGR (approx)", f"{(equity.iloc[-1]**(252/len(equity)) - 1):.2%}" if len(equity)>0 else "n/a")
-        bt_c2.metric("Sharpe", f"{sharpe_ratio(strat_rets, rf=risk_free):.2f}")
-        bt_c3.metric("Sortino", f"{sortino_ratio(strat_rets, rf=risk_free):.2f}")
-        bt_c4.metric("Max Drawdown", f"{rolling_max_drawdown(equity):.2%}")
-
-        st.plotly_chart(plot_equity(equity, title=f"{name}: Strategy Equity (Test)"), use_container_width=True)
-
-        # Save for comparison table
-        results.append({
-            "Model": name,
-            "Val_Acc": v_acc, "Val_F1": v_f1, "Val_AUC": v_auc,
-            "Test_Acc": t_acc, "Test_F1": t_f1, "Test_AUC": t_auc,
-            "Test_Sharpe": sharpe_ratio(strat_rets, rf=risk_free),
-            "Test_Sortino": sortino_ratio(strat_rets, rf=risk_free),
-            "Test_MDD": rolling_max_drawdown(equity),
-            "Test_CAGR_est": (equity.iloc[-1]**(252/len(equity)) - 1) if len(equity)>0 else np.nan
-        })
-
-# =============== Comparison ===============
-if results:
-    st.subheader("📌 Model Comparison (Validation & Test)")
-    comp = pd.DataFrame(results)
-    st.dataframe(
-        comp.set_index("Model").style.format({
-            "Val_Acc":"{:.3f}", "Val_F1":"{:.3f}", "Val_AUC":"{:.3f}",
-            "Test_Acc":"{:.3f}", "Test_F1":"{:.3f}", "Test_AUC":"{:.3f}",
-            "Test_Sharpe":"{:.2f}", "Test_Sortino":"{:.2f}",
-            "Test_MDD":"{:.2%}", "Test_CAGR_est":"{:.2%}"
-        }),
-        use_container_width=True
-    )
-
-# =============== Raw Charts ===============
-st.subheader("📈 Price Chart")
-st.plotly_chart(plot_price(work, price_col=price_col, title="Close Price"), use_container_width=True)
-
-# =============== Download Section ===============
-st.subheader("⬇️ Exports")
-# Processed dataset
-processed_csv = work.reset_index().rename(columns={"index":"Date"}).to_csv(index=False).encode("utf-8")
-st.download_button(
-    "Download processed dataset (CSV)",
-    data=processed_csv,
-    file_name="processed_features_labels.csv",
-    mime="text/csv"
+st.markdown(
+    """
+    <style>
+    .small {font-size:0.9rem;color:#555}
+    .ok   {color:#0b8a42;font-weight:600}
+    .warn {color:#b36b00;font-weight:600}
+    .bad  {color:#c72d2d;font-weight:600}
+    </style>
+    """,
+    unsafe_allow_html=True
 )
 
-# Comparison table
-if results:
-    comp_csv = pd.DataFrame(results).to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download model comparison (CSV)",
-        data=comp_csv,
-        file_name="model_comparison.csv",
-        mime="text/csv"
-    )
+DATA_FILES = {
+    "S&P 500":     {"feat": "sp500_full_features.csv",   "base": "sp500_full_data.csv"},
+    "FTSE 100":    {"feat": "ftse100_full_features.csv", "base": "ftse100_full_data.csv"},
+    "NIFTY 50":    {"feat": "nifty50_full_features.csv", "base": "nifty50_full_data.csv"},
+    "BOVESPA":     {"feat": "bovespa_full_features.csv", "base": "bovespa_full_data.csv"},
+}
 
-# =============== Template Helper ===============
-with st.expander("📄 CSV Template (click to download)"):
-    template = pd.DataFrame({
-        "Date": pd.date_range("2022-01-03", periods=30, freq="B"),
-        "Close": np.linspace(100, 110, 30),
-        "Volume": np.random.randint(100000, 200000, 30)
-    })
-    buf = io.StringIO()
-    template.to_csv(buf, index=False)
-    st.download_button(
-        "Download minimal template",
-        data=buf.getvalue().encode("utf-8"),
-        file_name="price_data_template.csv",
-        mime="text/csv"
-    )
+DEFAULT_FEATURES = [
+    # If your *_full_features have these already, great.
+    # If not, we'll compute (Return_1D, SMA_20, SMA_50, Volatility_20)
+    "Return_1D", "SMA_20", "SMA_50", "Volatility_20"
+]
 
-st.caption("Tip: Label = 1 if future return over the chosen horizon exceeds threshold; else 0. Strategy goes long when predicted probability ≥ threshold (no short).")
+# ---------------------------
+# Helpers
+# ---------------------------
+@st.cache_data(show_spinner=False)
+def load_market_df(market_key: str) -> pd.DataFrame:
+    """Load features first; else base data. Ensure canonical columns & features."""
+    files = DATA_FILES[market_key]
+    df = None
+    for f in [files["feat"], files["base"]]:
+        if os.path.exists(f):
+            df = pd.read_csv(f)
+            break
+    if df is None:
+        return pd.DataFrame()  # not found
+
+    # Normalize column names
+    df.columns = [c.strip() for c in df.columns]
+    # Flexible date col
+    date_col = None
+    for c in ["Date", "date", "DATE", "Price_Ticker"]:
+        if c in df.columns:
+            date_col = c
+            break
+    if date_col is None:
+        # Try to infer if first col looks like date
+        if df.columns[0].lower().startswith("date"):
+            date_col = df.columns[0]
+        else:
+            # give up
+            return pd.DataFrame()
+
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df[df[date_col].notna()].sort_values(by=date_col).reset_index(drop=True)
+    df = df.rename(columns={date_col: "Date"})
+
+    # Basic required columns
+    must_have = ["Date", "Ticker", "Close"]
+    for need in must_have:
+        if need not in df.columns:
+            # try fallback names
+            if need == "Ticker":
+                # sometimes uppercase
+                if "TICKER" in df.columns:
+                    df = df.rename(columns={"TICKER": "Ticker"})
+            if need == "Close":
+                for alt in ["Adj Close", "Close_AAPL", "close"]:
+                    if alt in df.columns:
+                        df = df.rename(columns={alt: "Close"})
+                        break
+
+    # Drop junk rows
+    df = df[df["Close"].astype(str).str.isnumeric() | df["Close"].apply(lambda x: isinstance(x, (int, float)))]
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    df = df[df["Close"].notna()]
+
+    # Compute missing minimal features by ticker
+    if "Return_1D" not in df.columns:
+        df["Return_1D"] = df.groupby("Ticker")["Close"].pct_change()
+    if "SMA_20" not in df.columns:
+        df["SMA_20"] = df.groupby("Ticker")["Close"].transform(lambda s: s.rolling(20, min_periods=5).mean())
+    if "SMA_50" not in df.columns:
+        df["SMA_50"] = df.groupby("Ticker")["Close"].transform(lambda s: s.rolling(50, min_periods=10).mean())
+    if "Volatility_20" not in df.columns:
+        df["Volatility_20"] = df.groupby("Ticker")["Return_1D"].transform(lambda s: s.rolling(20, min_periods=5).std())
+
+    # Ensure Target (next-day up/down) exists
+    if "Target" not in df.columns:
+        df["Future_Return_1D"] = df.groupby("Ticker")["Close"].pct_change(-1) * -1  # next day relative to today
+        # Simpler: shift(-1) on Close then pct_change from today -> tomorrow:
+        df["Future_Close"] = df.groupby("Ticker")["Close"].shift(-1)
+        df["Future_Ret"] = (df["Future_Close"] / df["Close"]) - 1.0
+        df["Target"] = (df["Future_Ret"] > 0).astype(int)
+
+    # Clean residual NaNs
+    df = df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
+    return df
+
+
+def make_date_slider_values(df: pd.DataFrame, market: str):
+    if df.empty:
+        return None, None
+    return pd.to_datetime(df["Date"].min()).date(), pd.to_datetime(df["Date"].max()).date()
+
+
+def filter_df(df, tickers, start_date, end_date):
+    mask = (df["Date"] >= pd.to_datetime(start_date)) & (df["Date"] <= pd.to_datetime(end_date))
+    if tickers:
+        df = df[df["Ticker"].isin(tickers)]
+    return df[mask].copy()
+
+
+def plot_price_and_sma(df):
+    fig = go.Figure()
+    for tkr in sorted(df["Ticker"].unique()):
+        sub = df[df["Ticker"] == tkr]
+        fig.add_trace(go.Scatter(x=sub["Date"], y=sub["Close"], name=f"{tkr} Close", mode="lines"))
+        if "SMA_20" in sub.columns:
+            fig.add_trace(go.Scatter(x=sub["Date"], y=sub["SMA_20"], name=f"{tkr} SMA 20", mode="lines"))
+    fig.update_layout(title="Close vs 20-Day SMA", legend_title=None, height=450)
+    return fig
+
+
+def plot_return_hist(df):
+    sub = df.copy()
+    sub["Return_1D"] = pd.to_numeric(sub["Return_1D"], errors="coerce")
+    sub = sub[np.isfinite(sub["Return_1D"])]
+    if sub.empty:
+        return go.Figure()
+    fig = px.histogram(sub, x="Return_1D", nbins=50, title="Daily Return Distribution", marginal="box")
+    return fig
+
+
+def plot_volatility(df):
+    if "Volatility_20" not in df.columns:
+        return go.Figure()
+    fig = px.line(df, x="Date", y="Volatility_20", color="Ticker", title="20‑Day Rolling Volatility")
+    return fig
+
+
+def compute_summary_table(df):
+    out = []
+    for tkr, g in df.groupby("Ticker"):
+        ret = g["Return_1D"].dropna()
+        if ret.empty:
+            continue
+        ann_ret = (1 + ret.mean())**252 - 1
+        ann_vol = ret.std() * np.sqrt(252)
+        sharpe = ann_ret / ann_vol if ann_vol and np.isfinite(ann_vol) else np.nan
+        out.append([tkr, ann_ret, ann_vol, sharpe, ret.skew(), ret.kurtosis()])
+    if not out:
+        return pd.DataFrame()
+    tbl = pd.DataFrame(out, columns=["Ticker", "Ann. Return", "Ann. Vol", "Sharpe", "Skew", "Kurtosis"])
+    return tbl.sort_values("Sharpe", ascending=False)
+
+
+def train_models_classification(df, features, c_val=1.0, n_trees=200, use_ann=False):
+    """
+    TimeSeriesSplit on concatenated panel (we standardize per split).
+    Predicts next-day up/down (Target).
+    """
+    # Clean
+    work = df.copy()
+    work = work.dropna(subset=["Target"])
+    for f in features:
+        if f not in work.columns:
+            work[f] = np.nan
+    work = work.dropna(subset=features)
+
+    if work.empty:
+        return None, pd.DataFrame()
+
+    X = work[features].values
+    y = work["Target"].values
+
+    tscv = TimeSeriesSplit(n_splits=5)
+    rows = []
+    # Models
+    rf = RandomForestClassifier(n_estimators=n_trees, random_state=42, n_jobs=-1)
+    svm = SVC(C=c_val, kernel="rbf", probability=True, random_state=42)
+
+    # Optional ANN
+    def build_ann(input_dim):
+        model = Sequential([
+            Dense(64, activation='relu', input_shape=(input_dim,)),
+            Dropout(0.2),
+            Dense(32, activation='relu'),
+            Dropout(0.1),
+            Dense(1, activation='sigmoid')
+        ])
+        model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+        return model
+
+    for fold, (train_idx, test_idx) in enumerate(tscv.split(X), 1):
+        X_tr, X_te = X[train_idx], X[test_idx]
+        y_tr, y_te = y[train_idx], y[test_idx]
+
+        scaler = StandardScaler()
+        X_tr_s = scaler.fit_transform(X_tr)
+        X_te_s = scaler.transform(X_te)
+
+        # RF
+        rf.fit(X_tr, y_tr)
+        p_rf = rf.predict(X_te)
+        pr_rf = rf.predict_proba(X_te)[:, 1] if hasattr(rf, "predict_proba") else (p_rf * 1.0)
+        rows.append(["RandomForest", fold,
+                    accuracy_score(y_te, p_rf),
+                    precision_score(y_te, p_rf, zero_division=0),
+                    recall_score(y_te, p_rf, zero_division=0),
+                    f1_score(y_te, p_rf, zero_division=0),
+                    safe_auc(y_te, pr_rf)])
+
+        # SVM
+        svm.fit(X_tr_s, y_tr)
+        p_svm = svm.predict(X_te_s)
+        pr_svm = svm.predict_proba(X_te_s)[:, 1] if hasattr(svm, "predict_proba") else (p_svm * 1.0)
+        rows.append(["SVM (RBF)", fold,
+                    accuracy_score(y_te, p_svm),
+                    precision_score(y_te, p_svm, zero_division=0),
+                    recall_score(y_te, p_svm, zero_division=0),
+                    f1_score(y_te, p_svm, zero_division=0),
+                    safe_auc(y_te, pr_svm)])
+
+        # ANN (optional)
+        if use_ann and TF_OK:
+            ann = build_ann(X_tr_s.shape[1])
+            ann.fit(X_tr_s, y_tr, epochs=10, batch_size=256, verbose=0, validation_split=0.1)
+            pr_ann = ann.predict(X_te_s, verbose=0).reshape(-1)
+            p_ann = (pr_ann >= 0.5).astype(int)
+            rows.append(["ANN (MLP)", fold,
+                        accuracy_score(y_te, p_ann),
+                        precision_score(y_te, p_ann, zero_division=0),
+                        recall_score(y_te, p_ann, zero_division=0),
+                        f1_score(y_te, p_ann, zero_division=0),
+                        safe_auc(y_te, pr_ann)])
+
+    res = pd.DataFrame(rows, columns=["Model", "Fold", "Accuracy", "Precision", "Recall", "F1", "ROC_AUC"])
+    return {"rf": rf, "svm": svm}, res
+
+
+def safe_auc(y_true, y_score):
+    try:
+        return roc_auc_score(y_true, y_score)
+    except Exception:
+        return np.nan
+
+
+# ---------------------------
+# UI
+# ---------------------------
+st.title("Machine Learning Applications in Finance — Dashboard")
+
+tab_over, tab_data, tab_eda, tab_models, tab_auto = st.tabs(
+    ["Overview", "Data Explorer", "EDA", "Models", "Auto‑Results"]
+)
+
+# -------- Overview --------
+with tab_over:
+    st.subheader("Project Overview")
+    st.markdown(
+        """
+        **Goal:** Benchmark common ML models (RF, SVM, ANN) for **next‑day direction** across **developed vs. emerging markets** and connect results to investment‑relevant metrics (accuracy, F1, ROC‑AUC).
+
+        **What’s here:**
+        - _Data Explorer_: browse and filter by market/ticker/date.
+        - _EDA_: return distribution, price vs. SMA, rolling volatility, summary stats.
+        - _Models_: train RF/SVM/ANN quickly on selected universe + features.
+        - _Auto‑Results_: one‑click training + export a CSV for your report.
+
+        **Research linkage:** aligns to objectives on (i) real‑world impact, (ii) model comparability, and (iii) developed vs. emerging contrasts.
+        """
+    )
+    st.caption("Tip: If a market file is missing, that tab will gracefully show an empty state.")
+
+# -------- Data Explorer --------
+with tab_data:
+    st.subheader("Data Explorer")
+    market = st.selectbox("Market", list(DATA_FILES.keys()))
+    df_market = load_market_df(market)
+    if df_market.empty:
+        st.warning(f"No data found for **{market}**. Ensure CSVs exist in repo root.")
+    else:
+        min_d, max_d = make_date_slider_values(df_market, market)
+        # Ensure proper datetime.date types for slider
+        min_d, max_d = pd.to_datetime(min_d).date(), pd.to_datetime(max_d).date()
+        tickers = sorted(df_market["Ticker"].dropna().unique().tolist())
+        sel_tickers = st.multiselect("Tickers", tickers, default=tickers[:3])
+
+        date_range = st.slider(
+            "Select Date Range",
+            min_value=min_d,
+            max_value=max_d,
+            value=(min_d, max_d)
+        )
+
+        view = filter_df(df_market, sel_tickers, date_range[0], date_range[1])
+        st.markdown(f"**Rows:** {len(view):,} | **Tickers:** {len(sel_tickers)} | **Date:** {date_range[0]} → {date_range[1]}")
+        st.dataframe(view.head(500), use_container_width=True)
+
+        with st.expander("Columns detected"):
+            st.write(list(view.columns))
+
+# -------- EDA --------
+with tab_eda:
+    st.subheader("Exploratory Data Analysis")
+    market_e = st.selectbox("Market (EDA)", list(DATA_FILES.keys()), key="eda_market")
+    df_e = load_market_df(market_e)
+    if df_e.empty:
+        st.warning(f"No data for **{market_e}**.")
+    else:
+        min_d, max_d = make_date_slider_values(df_e, market_e)
+        min_d, max_d = pd.to_datetime(min_d).date(), pd.to_datetime(max_d).date()
+        tickers_e = sorted(df_e["Ticker"].dropna().unique().tolist())
+        sel_tickers_e = st.multiselect("Tickers", tickers_e, default=tickers_e[:2], key="eda_tickers")
+
+        date_range_e = st.slider(
+            "Date Range",
+            min_value=min_d,
+            max_value=max_d,
+            value=(min_d, max_d),
+            key="eda_dates"
+        )
+        view_e = filter_df(df_e, sel_tickers_e, date_range_e[0], date_range_e[1])
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(plot_price_and_sma(view_e), use_container_width=True)
+            st.caption("**20‑Day SMA vs Close** shows short‑term trend vs. price.")
+        with c2:
+            st.plotly_chart(plot_return_hist(view_e), use_container_width=True)
+            st.caption("**Daily Return Distribution**: location/spread/skew/kurtosis → volatility/risk clues.")
+
+        st.plotly_chart(plot_volatility(view_e), use_container_width=True)
+        st.caption("**Rolling Volatility (20‑day)** approximates short‑run risk. Spikes often line up with macro/news shocks.")
+
+        st.markdown("### Summary by Ticker (selected range)")
+        table = compute_summary_table(view_e)
+        if table.empty:
+            st.info("Not enough return data to compute summary.")
+        else:
+            st.dataframe(table, use_container_width=True, height=300)
+
+# -------- Models --------
+with tab_models:
+    st.subheader("Quick Model Benchmarks (Classification: next‑day up/down)")
+    market_m = st.selectbox("Market (Models)", list(DATA_FILES.keys()), key="mdl_market")
+    df_m = load_market_df(market_m)
+    if df_m.empty:
+        st.warning(f"No data for **{market_m}**.")
+    else:
+        # Choose tickers
+        all_t = sorted(df_m["Ticker"].dropna().unique().tolist())
+        sel_t = st.multiselect("Tickers (train on these)", all_t, default=all_t[:5], key="mdl_tickers")
+
+        # Feature selection (only keep what's available)
+        avail_feats = [f for f in DEFAULT_FEATURES if f in df_m.columns]
+        if not avail_feats:
+            st.error("No default features found; falling back to simple features computed from Close.")
+            avail_feats = ["Return_1D", "SMA_20", "SMA_50", "Volatility_20"]
+
+        features = st.multiselect("Features", sorted(list(set(avail_feats + DEFAULT_FEATURES))), default=avail_feats)
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            C_val = st.number_input("SVM C", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
+        with col_b:
+            n_trees = st.number_input("RF n_estimators", min_value=50, max_value=1000, value=200, step=50)
+        with col_c:
+            use_ann = st.checkbox("Include ANN (requires TensorFlow)", value=False and TF_OK)
+            if use_ann and not TF_OK:
+                st.warning("TensorFlow not available in this environment. ANN will be skipped.")
+
+        # Filter to tickers (all dates)
+        if sel_t:
+            work = df_m[df_m["Ticker"].isin(sel_t)].copy()
+        else:
+            work = df_m.copy()
+
+        # Train
+        if st.button("Train & Evaluate"):
+            models, res = train_models_classification(work, features, c_val=C_val, n_trees=n_trees, use_ann=use_ann and TF_OK)
+            if res.empty:
+                st.error("No rows after cleaning. Check features/Target availability.")
+            else:
+                st.success("Training complete.")
+                st.dataframe(res, use_container_width=True)
+                st.markdown("**Fold averages**")
+                st.dataframe(res.groupby("Model", as_index=False).mean(numeric_only=True), use_container_width=True)
+
+# -------- Auto‑Results (for report) --------
+with tab_auto:
+    st.subheader("Auto‑Generate Results CSV")
+    st.caption("Runs RF & SVM across each market on default features (panel data, next‑day up/down). Saves a consolidated CSV for your report.")
+
+    target_markets = st.multiselect(
+        "Select markets to run",
+        list(DATA_FILES.keys()),
+        default=list(DATA_FILES.keys())
+    )
+    include_ann = st.checkbox("Include ANN (TensorFlow required)", value=False and TF_OK)
+    run_btn = st.button("Run All & Build CSV")
+
+    if run_btn:
+        rows = []
+        for m in target_markets:
+            dfx = load_market_df(m)
+            if dfx.empty:
+                continue
+            feats = [f for f in DEFAULT_FEATURES if f in dfx.columns]
+            if not feats:
+                feats = ["Return_1D", "SMA_20", "SMA_50", "Volatility_20"]
+
+            # Use top tickers by count
+            top_t = (
+                dfx.groupby("Ticker")["Date"]
+                .count()
+                .sort_values(ascending=False)
+                .head(30)
+                .index.tolist()
+            )
+            work = dfx[dfx["Ticker"].isin(top_t)].copy()
+
+            _, res = train_models_classification(work, feats, c_val=1.0, n_trees=250, use_ann=include_ann and TF_OK)
+            if not res.empty:
+                res["Market"] = m
+                res["Features"] = ",".join(feats)
+                rows.append(res)
+
+        if not rows:
+            st.error("No results produced (check data files).")
+        else:
+            out = pd.concat(rows, ignore_index=True)
+            st.dataframe(out, use_container_width=True)
+
+            # Save to buffer for download
+            buf = io.StringIO()
+            out.to_csv(buf, index=False)
+            st.download_button(
+                "Download results.csv",
+                data=buf.getvalue(),
+                file_name="model_results.csv",
+                mime="text/csv"
+            )
+            st.success("Results ready. Use this file in your ‘ML model results’ section.")
+
+
+# ---------------------------
+# Footer
+# ---------------------------
+st.markdown(
+    """
+    <hr class='small' />
+    <div class='small'>
+      <b>Notes</b>:
+      1) Target = 1 if next‑day close &gt; today’s close (panel classification).<br>
+      2) Default features: Return_1D, SMA_20, SMA_50, Volatility_20 (auto‑computed if missing).<br>
+      3) Models use TimeSeriesSplit (5 folds). SVM uses scaled features. RF uses raw features.<br>
+      4) ANN is optional; enable only if TensorFlow is in requirements.
+    </div>
+    """,
+    unsafe_allow_html=True
+)
