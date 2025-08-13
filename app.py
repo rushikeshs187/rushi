@@ -1,198 +1,84 @@
-# app.py
-import sys
-from datetime import date, timedelta
-
-import numpy as np
+import io
 import pandas as pd
 import streamlit as st
+import plotly.express as px
+from utils import prepare_timeseries, compute_returns, compute_kpis
+from eda import basic_profile, plot_price_with_bands, plot_rsi, plot_returns_hist, plot_corr
 
-# Try Plotly; fall back to Streamlit charts if not available
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-    _HAS_PLOTLY = True
-except Exception:
-    _HAS_PLOTLY = False
+st.set_page_config(page_title="IBR Finance: ML-in-Finance EDA", layout="wide")
 
-from utils import (
-    load_csv,
-    fetch_ticker_history,
-    add_technical_indicators,
-    compute_kpis,
-    to_returns,
-)
+st.title("📊 IBR Finance — Markets EDA Dashboard")
+st.caption("Focus: real-world effect (KPIs), model compatibility signals (indicators), and EM/DV markets readiness.")
 
-st.set_page_config(
-    page_title="IBR Finance Dashboard",
-    page_icon="📊",
-    layout="wide",
-)
+with st.sidebar:
+    st.header("Data")
+    src = st.radio("Choose data source", ["Upload CSV"], horizontal=True)
+    date_col = st.text_input("Date column name (optional)", value="")
+    price_col = st.text_input("Price column name", value="Adj Close")
+    rsi_window = st.number_input("RSI window", 5, 50, 14, 1)
+    periods_per_year = st.selectbox("Periods/year", [252, 365, 52, 12], index=0)
+    st.markdown("---")
+    st.header("About")
+    st.markdown("Objectives: 1) Real-world KPIs, 2) Model-readiness indicators, 3) Emerging-vs-Developed comparability.")
 
-# =========================
-# Sidebar controls
-# =========================
-st.sidebar.title("📁 Data source")
-source = st.sidebar.radio("Choose data source:", ["Upload CSV", "Yahoo Finance (yfinance)"])
-
-uploaded = None
-date_col = None
-price_col = None
-ticker = None
-years = None
-
-if source == "Upload CSV":
-    uploaded = st.sidebar.file_uploader("Upload a CSV with Date and Close (OHLC optional)", type=["csv"])
-    date_col = st.sidebar.text_input("Date column name", value="Date")
-    price_col = st.sidebar.text_input("Close/Price column name", value="Close")
-else:
-    ticker = st.sidebar.text_input("Ticker (e.g., AAPL, TSLA, ^GSPC, BTC-USD)", value="AAPL")
-    years = st.sidebar.slider("Years of history", 1, 10, 3)
-
-st.sidebar.markdown("---")
-st.sidebar.title("🧮 Indicators")
-show_sma = st.sidebar.checkbox("SMA (20/50)", value=True)
-show_rsi = st.sidebar.checkbox("RSI (14)", value=True)
-show_bbands = st.sidebar.checkbox("Bollinger Bands (20, 2σ)", value=True)
-
-st.sidebar.markdown("---")
-st.sidebar.title("⚙️ Chart options")
-log_scale = st.sidebar.checkbox("Log scale", value=False)
-show_volume = st.sidebar.checkbox("Show Volume", value=True)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Built for IBR Finance • Streamlit + Plotly")
-
-# =========================
-# Load data
-# =========================
 @st.cache_data(show_spinner=False)
-def _load_data(source, uploaded, date_col, price_col, ticker, years):
-    if source == "Upload CSV":
-        if uploaded is None:
-            return None, "Please upload a CSV to proceed."
-        df, err = load_csv(uploaded, date_col=date_col)
-        if err:
-            return None, err
-        # Standardize price column name to 'Close'
-        if price_col not in df.columns:
-            return None, f"Couldn't find price column '{price_col}' in the file."
-        if "Close" not in df.columns:
-            df = df.rename(columns={price_col: "Close"})
-        return df, None
-    else:
-        df, err = fetch_ticker_history(ticker, years)
-        return df, err
+def _read_csv(file_bytes):
+    return pd.read_csv(io.BytesIO(file_bytes))
 
-df, err = _load_data(
-    source,
-    uploaded if source == "Upload CSV" else None,
-    date_col if source == "Upload CSV" else None,
-    price_col if source == "Upload CSV" else None,
-    ticker if source == "Yahoo Finance (yfinance)" else None,
-    years if source == "Yahoo Finance (yfinance)" else None,
-)
+df = None
+uploaded = st.file_uploader("Upload a CSV with price data", type=["csv"])
+if uploaded is not None:
+    try:
+        raw = _read_csv(uploaded.getvalue())
+        df = prepare_timeseries(raw, date_col=date_col or None, price_col=price_col)
+        # Recompute RSI with chosen window if available price:
+        if price_col in df.columns:
+            from utils import rsi as _rsi
+            df["RSI"] = _rsi(df[price_col], window=rsi_window)
+    except Exception as e:
+        st.error(f"Could not parse file: {e}")
 
-if err:
-    st.warning(err)
-    st.stop()
-if df is None or df.empty:
-    st.info("No data yet. Provide a CSV or a ticker to begin.")
+if df is None:
+    st.info("Upload a CSV to start. Expected columns: a date column + price (Adj Close or Close).")
     st.stop()
 
-df = add_technical_indicators(df, sma=show_sma, rsi=show_rsi, bb=show_bbands)
+# ---------- KPIs (Objective 1) ----------
+ret, px_series = compute_returns(df, price_col=price_col)
+k = compute_kpis(df, price_col=price_col, risk_free_annual=0.0, periods_per_year=periods_per_year)
 
-# =========================
-# Header & KPIs
-# =========================
-left, mid, right = st.columns([2, 3, 2], gap="large")
+kpi_cols = st.columns(6)
+kpi_cols[0].metric("Sharpe", f"{k['Sharpe']:.2f}" if pd.notna(k['Sharpe']) else "NA")
+kpi_cols[1].metric("CAGR", f"{k['CAGR']*100:.2f}%" if pd.notna(k['CAGR']) else "NA")
+kpi_cols[2].metric("Max Drawdown", f"{k['Max Drawdown']*100:.2f}%" if pd.notna(k['Max Drawdown']) else "NA")
+kpi_cols[3].metric("Hit Rate", f"{k['Hit Rate']*100:.2f}%" if pd.notna(k['Hit Rate']) else "NA")
+kpi_cols[4].metric("Ann Return", f"{k['Ann Return']*100:.2f}%" if pd.notna(k['Ann Return']) else "NA")
+kpi_cols[5].metric("Ann Vol", f"{k['Ann Vol']*100:.2f}%" if pd.notna(k['Ann Vol']) else "NA")
 
-with left:
-    st.title("📈 Finance Dashboard")
-    src_label = "CSV Upload" if source == "Upload CSV" else f"Yahoo Finance • {ticker.upper()}"
-    st.caption(f"Data source: {src_label}  |  Rows: {len(df):,}")
+st.markdown("### Price & Bands (Model‑readiness signals)")
+st.plotly_chart(plot_price_with_bands(df, price_col=price_col), use_container_width=True)
 
-with mid:
-    k = compute_kpis(df)
-    c1, c2, c3, c4 = st.columns(4)
-    last_str = f"{k['price_last']:.2f}" if np.isfinite(k['price_last']) else "—"
-    c1.metric("Price (last)", last_str, f"{k['d1']:+.2f}% D1" if np.isfinite(k['d1']) else None)
-    c2.metric("MTD", f"{k['mtd']:+.2f}%" if np.isfinite(k['mtd']) else "—")
-    c3.metric("YTD", f"{k['ytd']:+.2f}%" if np.isfinite(k['ytd']) else "—")
-    c4.metric("Sharpe (daily≈252)", f"{k['sharpe']:.2f}" if np.isfinite(k['sharpe']) else "—")
-
-with right:
-    st.write("")
-    st.write("")
-    st.caption("Tip: toggle indicators in the sidebar. Export below.")
-
-# =========================
-# Price Chart
-# =========================
-st.subheader("Price & Indicators")
-
-def _plot_main(df):
-    if _HAS_PLOTLY:
-        fig = go.Figure()
-        # Price
-        fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", mode="lines"))
-        # Indicators
-        if show_sma and "SMA20" in df and "SMA50" in df:
-            fig.add_trace(go.Scatter(x=df.index, y=df["SMA20"], name="SMA20", mode="lines"))
-            fig.add_trace(go.Scatter(x=df.index, y=df["SMA50"], name="SMA50", mode="lines"))
-        if show_bbands and {"BB_M","BB_U","BB_L"}.issubset(df.columns):
-            fig.add_trace(go.Scatter(x=df.index, y=df["BB_U"], name="BB Upper", mode="lines"))
-            fig.add_trace(go.Scatter(x=df.index, y=df["BB_M"], name="BB Mid", mode="lines"))
-            fig.add_trace(go.Scatter(x=df.index, y=df["BB_L"], name="BB Lower", mode="lines"))
-        if log_scale:
-            fig.update_yaxes(type="log")
-        fig.update_layout(height=500, legend_title_text="Legend", margin=dict(l=10,r=10,t=10,b=10))
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        cols = ["Close"] + [c for c in ["SMA20","SMA50","BB_U","BB_M","BB_L"] if c in df.columns]
-        st.line_chart(df[cols])
-
-_plot_main(df)
-
-# =========================
-# RSI (secondary)
-# =========================
-if show_rsi and "RSI" in df:
-    st.subheader("RSI (14)")
-    if _HAS_PLOTLY:
-        rfig = px.line(df, x=df.index, y="RSI", title=None)
-        rfig.add_hrect(y0=30, y1=70, line_width=0, fillcolor="lightgray", opacity=0.2)
-        rfig.update_layout(height=250, margin=dict(l=10,r=10,t=10,b=10))
-        st.plotly_chart(rfig, use_container_width=True)
-    else:
-        st.line_chart(df[["RSI"]])
-
-# =========================
-# Returns & simple distribution
-# =========================
-st.subheader("Returns & Distribution")
-ret_df = to_returns(df)
-c1, c2 = st.columns(2)
+c1, c2 = st.columns([1,1])
 with c1:
-    st.caption("Daily returns (last 10)")
-    st.dataframe(ret_df.tail(10))
+    st.markdown("### RSI")
+    st.plotly_chart(plot_rsi(df), use_container_width=True)
 with c2:
-    if _HAS_PLOTLY:
-        clean = ret_df.dropna()
-        if not clean.empty:
-            h = px.histogram(clean, x="Returns", nbins=50, title="Return distribution")
-            h.update_layout(height=300, margin=dict(l=10,r=10,t=35,b=10), title_x=0.2)
-            st.plotly_chart(h, use_container_width=True)
-        else:
-            st.info("Not enough returns to plot a histogram yet.")
-    else:
-        st.bar_chart(ret_df.tail(60)["Returns"])
+    st.markdown("### Returns distribution")
+    st.plotly_chart(plot_returns_hist(ret), use_container_width=True)
 
-st.markdown("---")
-st.download_button(
-    "⬇️ Download enriched dataset (CSV)",
-    data=df.to_csv(index=True).encode("utf-8"),
-    file_name="enriched_market_data.csv",
-    mime="text/csv",
-)
+# ---------- EDA Summary (Objective 2 & 3 context) ----------
+st.markdown("### EDA Overview")
+prof = basic_profile(df.select_dtypes(include="number"))
+st.dataframe(prof, height=320, use_container_width=True)
 
-st.caption("If Plotly isn't installed, charts fall back to Streamlit's native charts.")
+st.markdown("### Correlation heatmap (numeric features)")
+st.plotly_chart(plot_corr(df), use_container_width=True)
+
+# ---------- Notes aligned to objectives ----------
+with st.expander("How this aligns to your objectives"):
+    st.markdown(
+        """
+- **Real‑world effect:** KPIs (Sharpe, CAGR, MDD, Hit‑Rate) are computed on your uploaded data with robust guards (no ambiguous truth comparisons).
+- **Model compatibility:** Indicators (RSI, SMA/EMA, Bollinger) + correlation give quick signal quality checks before RF/SVM/ANN.
+- **Emerging vs Developed:** Upload multiple assets/markets; compare KPI panels and distributions to discuss regional factors.
+        """
+    )
