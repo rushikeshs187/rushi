@@ -1,147 +1,247 @@
-# app.py
-import streamlit as st
-import pandas as pd
+import os
+from datetime import date, timedelta
+
 import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
 
-from data import fetch_many
-from features import build_indicators, prepare_ml_frame, compute_kpis
-from modeling import train_and_score_models, backtest_from_proba
-from ui import (
-    kpi_row, price_with_bands, rsi_chart, macd_chart, returns_hist,
-    model_table, equity_curve_chart, corr_heatmap, info_note
+from data import fetch_many, allowed_periods, allowed_intervals, normalize_close
+from features import build_indicators
+from utils import (
+    compute_kpis, humanize_kpis, rolling_stats, compute_drawdown,
+    ensure_tz_safe_today, safe_pct_change
 )
 
-st.set_page_config(page_title="IBR Finance — ML & Markets", page_icon="📈", layout="wide")
-
-# ---------------- SIDEBAR ----------------
-st.sidebar.title("⚙️ Controls")
-
-markets = st.sidebar.selectbox(
-    "Market set",
-    ["Developed (DM)", "Emerging (EM)", "Custom"],
-    index=0
+# ---------- Streamlit Page Setup ----------
+st.set_page_config(
+    page_title="Finance EDA & Indicators Dashboard",
+    page_icon="📈",
+    layout="wide",
 )
 
-DM_DEFAULT = ["SPY", "AAPL", "MSFT", "NVDA", "QQQ", "GLD"]
-EM_DEFAULT = ["NIFTYBEES.NS", "RELIANCE.NS", "TCS.NS", "ICICIBANK.NS", "HDFCBANK.NS", "KOTAKBANK.NS"]
+st.title("📈 Finance EDA & Indicators Dashboard")
+st.caption("Auto-fetching data. No uploads required.")
 
-if markets == "Developed (DM)":
-    tickers = st.sidebar.text_input("Tickers (comma-separated)", ", ".join(DM_DEFAULT))
-elif markets == "Emerging (EM)":
-    tickers = st.sidebar.text_input("Tickers (comma-separated)", ", ".join(EM_DEFAULT))
-else:
-    tickers = st.sidebar.text_input("Tickers (comma-separated)", "SPY, AAPL, BTC-USD")
+# ---------- Sidebar Controls ----------
+with st.sidebar:
+    st.header("⚙️ Controls")
 
-period = st.sidebar.selectbox("Period", ["6mo", "1y", "2y", "5y", "10y", "max"], index=2)
-interval = st.sidebar.selectbox("Interval", ["1d", "1wk", "1mo"], index=0)
+    default_symbols = os.environ.get(
+        "DEFAULT_SYMBOLS",
+        "AAPL,MSFT,GOOGL,AMZN,NVDA"
+    )
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Indicators")
-rsi_win = st.sidebar.slider("RSI window", 5, 30, 14, 1)
-bb_win = st.sidebar.slider("Bollinger window", 10, 40, 20, 1)
-bb_std = st.sidebar.slider("Bollinger std", 1.0, 3.0, 2.0, 0.5)
-ema_fast = st.sidebar.slider("EMA fast", 5, 20, 12, 1)
-ema_slow = st.sidebar.slider("EMA slow", 15, 50, 26, 1)
-macd_sig = st.sidebar.slider("MACD signal", 5, 20, 9, 1)
+    symbols = st.text_input("Symbols (comma-separated)", default_symbols).upper()
+    symbols = [s.strip() for s in symbols.split(",") if s.strip()]
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("ML Target")
-horizon = st.sidebar.slider("Forward horizon (days)", 1, 30, 5, 1)
-threshold = st.sidebar.slider("Forward return threshold", -0.05, 0.05, 0.0, 0.005)
+    period = st.selectbox("History Period", allowed_periods(), index=6)  # 5y default
+    interval = st.selectbox("Data Interval", allowed_intervals(), index=4)  # 1d default
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Backtest")
-prob_threshold = st.sidebar.slider("Long when Prob(Up) ≥", 0.1, 0.9, 0.5, 0.05)
-est_cost_bps = st.sidebar.slider("Transaction cost (bps per trade)", 0, 50, 5, 1)
+    st.divider()
+    st.subheader("Indicators")
+    rsi_win = st.slider("RSI window", 5, 50, 14, 1)
+    ema_fast = st.slider("EMA Fast", 5, 50, 12, 1)
+    ema_slow = st.slider("EMA Slow", 10, 200, 26, 1)
+    macd_fast = st.slider("MACD Fast", 5, 50, 12, 1)
+    macd_slow = st.slider("MACD Slow", 10, 200, 26, 1)
+    macd_sig  = st.slider("MACD Signal", 3, 30, 9, 1)
+    bb_window = st.slider("Bollinger Window", 10, 60, 20, 1)
+    bb_stds   = st.slider("Bollinger Std Dev", 1.0, 4.0, 2.0, 0.5)
 
-# ---------------- HEADER ----------------
-st.title("📊 IBR Finance — ML Applications in Finance (DM vs EM)")
-st.caption("No upload required • Live data via yfinance • EDA + ML + Backtest • Objectives-aligned")
+    st.divider()
+    st.subheader("Benchmark (optional)")
+    bench = st.text_input("Benchmark symbol", "SPY").strip().upper()
 
-# ---------------- DATA ----------------
-symbols = [t.strip() for t in tickers.split(",") if t.strip()]
-with st.spinner("Fetching market data..."):
+# ---------- Fetch Data ----------
+today = ensure_tz_safe_today()
+try:
     panel = fetch_many(symbols, period=period, interval=interval)
-
-if not panel:
-    st.error("No data fetched. Check tickers or internet access.")
+except Exception as e:
+    st.error(f"Data fetch failed: {e}")
     st.stop()
 
-# ---------------- TABS PER TICKER ----------------
-tabs = st.tabs(symbols)
+if not panel:
+    st.warning("No data could be retrieved for the requested symbols. "
+               "Try changing period/interval or symbols.")
+    st.stop()
 
-for tab, sym in zip(tabs, symbols):
-    with tab:
-        df = panel.get(sym)
-        if df is None or df.empty:
-            st.warning(f"{sym}: no data.")
+tabs = st.tabs(["Overview", "Per-Symbol EDA", "Indicators", "Portfolio KPIs"])
+
+# ---------- Overview Tab ----------
+with tabs[0]:
+    st.subheader("Summary Snapshot")
+
+    # Build a small table of last price and YTD/1Y returns for all tickers
+    rows = []
+    for sym, df in panel.items():
+        if df.empty or "Adj Close" not in df.columns:
             continue
+        last_px = float(df["Adj Close"].dropna().iloc[-1]) if df["Adj Close"].dropna().size else np.nan
+        # returns
+        daily = safe_pct_change(df["Adj Close"]).dropna()
+        ytd = np.nan
+        one_year = np.nan
+        try:
+            ytd = (df["Adj Close"].iloc[-1] / df["Adj Close"][df.index.year == today.year].iloc[0] - 1) if (df.index.year == today.year).any() else np.nan
+        except Exception:
+            pass
+        if len(df) > 252:
+            one_year = float(df["Adj Close"].iloc[-1] / df["Adj Close"].iloc[-252] - 1)
+        rows.append({"Symbol": sym, "Last Price": last_px, "YTD": ytd, "1Y": one_year})
 
-        # Indicators & EDA frame
-        df_ind = build_indicators(df,
-                                  rsi_window=rsi_win,
-                                  bb_window=bb_win,
-                                  bb_std=bb_std,
-                                  ema_fast=ema_fast,
-                                  ema_slow=ema_slow,
-                                  macd_signal=macd_sig)
+    if rows:
+        snap = pd.DataFrame(rows).set_index("Symbol")
+        st.dataframe(snap.style.format({"Last Price": "{:,.2f}", "YTD": "{:.2%}", "1Y": "{:.2%}"}), use_container_width=True)
+    else:
+        st.info("No summary available.")
 
-        # KPIs (Objective 1: real-world effect, baseline)
-        k = compute_kpis(df_ind)
-        kpi_row(k)
+    st.divider()
+    st.subheader("Price Comparison")
+    norm_df = normalize_close(panel)
+    if not norm_df.empty:
+        fig = px.line(norm_df, x=norm_df.index, y=norm_df.columns, title="Normalized Adj Close (rebased to 100)")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Not enough data to chart.")
 
-        # Charts
-        c1, c2 = st.columns([2, 1], gap="large")
-        with c1:
-            st.plotly_chart(price_with_bands(df_ind), use_container_width=True)
-        with c2:
-            st.plotly_chart(rsi_chart(df_ind), use_container_width=True)
-            st.plotly_chart(macd_chart(df_ind), use_container_width=True)
+# ---------- Per-Symbol EDA Tab ----------
+with tabs[1]:
+    st.subheader("Explore a Symbol")
+    sym = st.selectbox("Pick symbol", list(panel.keys()))
+    df = panel.get(sym, pd.DataFrame()).copy()
 
-        c3, c4 = st.columns([1, 1], gap="large")
-        with c3:
-            st.plotly_chart(returns_hist(df_ind), use_container_width=True)
-        with c4:
-            st.plotly_chart(corr_heatmap(df_ind), use_container_width=True)
+    if df.empty or "Adj Close" not in df.columns:
+        st.warning("Selected symbol has no data.")
+    else:
+        colA, colB = st.columns([2, 1], vertical_alignment="top")
 
-        st.markdown("### 🤖 Model Comparison (RF • SVM • MLP) — Objective 2")
-        # ML frame (features + label)
-        ml_df = prepare_ml_frame(df_ind, horizon=horizon, threshold=threshold)
-        if ml_df is None or ml_df.empty or ml_df["Target"].nunique() < 2:
-            info_note("Not enough labeled data after preprocessing (need both classes 0/1). Adjust horizon/threshold or choose a longer period.")
-            continue
+        with colA:
+            pfig = go.Figure()
+            pfig.add_trace(go.Candlestick(
+                x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+                name="OHLC"
+            ))
+            pfig.update_layout(title=f"{sym} OHLC", xaxis_rangeslider_visible=False)
+            st.plotly_chart(pfig, use_container_width=True)
 
-        # Train & Evaluate (time-aware split)
-        with st.spinner("Training models..."):
-            results, preds = train_and_score_models(ml_df)
+            st.caption("Rolling Stats on Adj Close")
+            rs = rolling_stats(df["Adj Close"], windows=[20, 50, 100, 200])
+            if not rs.empty:
+                rfig = px.line(rs, title="Rolling Mean/Volatility")
+                st.plotly_chart(rfig, use_container_width=True)
 
-        st.plotly_chart(model_table(results), use_container_width=True)
+        with colB:
+            st.write("Quick Stats")
+            dd = compute_drawdown(df["Adj Close"])
+            metrics = {
+                "Last": df["Adj Close"].iloc[-1],
+                "Max Drawdown": dd["drawdown"].min(),
+                "Vol (20d)": df["Adj Close"].pct_change().rolling(20).std().iloc[-1],
+                "Vol (60d)": df["Adj Close"].pct_change().rolling(60).std().iloc[-1],
+            }
+            sm = pd.DataFrame.from_dict(metrics, orient="index", columns=["Value"])
+            st.dataframe(sm.style.format("{:,.4f}"))
 
-        st.markdown("### 📈 Backtest — Objective 1 (Real-world effect from model output)")
-        # Choose the best validation AUC model for backtest
-        best = results.sort_values("Val_AUC", ascending=False).iloc[0]
-        best_name = best["Model"]
-        proba_test = preds[best_name]["test_proba"]
-        price_test = preds[best_name]["price_test"]
-        dates_test = preds[best_name]["index_test"]
+        st.divider()
+        st.write("Return Distribution (daily)")
+        rets = df["Adj Close"].pct_change().dropna()
+        if len(rets):
+            hfig = px.histogram(rets, nbins=50, title=f"{sym} Daily Returns")
+            st.plotly_chart(hfig, use_container_width=True)
+        else:
+            st.info("Not enough daily returns to plot.")
 
-        # Backtest from probas
-        bt = backtest_from_proba(
-            price=price_test, proba=proba_test, index=dates_test,
-            prob_threshold=prob_threshold, cost_bps=est_cost_bps
+# ---------- Indicators Tab ----------
+with tabs[2]:
+    st.subheader("Technical Indicators")
+    sym2 = st.selectbox("Pick symbol for indicators", list(panel.keys()), key="ind_sym")
+    df2 = panel.get(sym2, pd.DataFrame()).copy()
+
+    if df2.empty or "Adj Close" not in df2.columns:
+        st.warning("Selected symbol has no data.")
+    else:
+        ind = build_indicators(
+            df2,
+            rsi_window=rsi_win,
+            ema_fast=ema_fast,
+            ema_slow=ema_slow,
+            macd_fast=macd_fast,
+            macd_slow=macd_slow,
+            macd_signal=macd_sig,
+            bb_window=bb_window,
+            bb_stds=bb_stds
         )
 
-        # Equity curve and metrics
-        st.plotly_chart(equity_curve_chart(bt["equity"]), use_container_width=True)
+        # Price + EMAs + Bollinger
+        p = go.Figure()
+        p.add_trace(go.Scatter(x=ind.index, y=ind["Adj Close"], name="Adj Close", mode="lines"))
+        for c in ["EMA_Fast", "EMA_Slow"]:
+            if c in ind:
+                p.add_trace(go.Scatter(x=ind.index, y=ind[c], name=c, mode="lines"))
+        if {"BB_Upper", "BB_Lower"}.issubset(ind.columns):
+            p.add_trace(go.Scatter(x=ind.index, y=ind["BB_Upper"], name="BB Upper", mode="lines"))
+            p.add_trace(go.Scatter(x=ind.index, y=ind["BB_Lower"], name="BB Lower", mode="lines"))
+        p.update_layout(title=f"{sym2} Price + EMAs + Bollinger")
+        st.plotly_chart(p, use_container_width=True)
 
-        bt_c1, bt_c2, bt_c3, bt_c4 = st.columns(4)
-        bt_c1.metric("CAGR", f"{bt['CAGR']:.2%}" if np.isfinite(bt['CAGR']) else "—")
-        bt_c2.metric("Sharpe", f"{bt['Sharpe']:.2f}" if np.isfinite(bt['Sharpe']) else "—")
-        bt_c3.metric("Sortino", f"{bt['Sortino']:.2f}" if np.isfinite(bt['Sortino']) else "—")
-        bt_c4.metric("Max Drawdown", f"{bt['MaxDD']:.2%}" if np.isfinite(bt['MaxDD']) else "—")
+        # RSI
+        if "RSI" in ind.columns:
+            rfig = px.line(ind, x=ind.index, y="RSI", title="RSI")
+            rfig.add_hline(y=70, line_dash="dash")
+            rfig.add_hline(y=30, line_dash="dash")
+            st.plotly_chart(rfig, use_container_width=True)
 
-        st.caption(f"Backtest based on best validation AUC model: **{best_name}**. "
-                   f"Long when Prob(Up) ≥ {prob_threshold:.2f}, cost = {est_cost_bps} bps/trade.")
+        # MACD
+        if {"MACD", "MACD_Signal"}.issubset(ind.columns):
+            m = go.Figure()
+            m.add_trace(go.Scatter(x=ind.index, y=ind["MACD"], name="MACD", mode="lines"))
+            m.add_trace(go.Scatter(x=ind.index, y=ind["MACD_Signal"], name="Signal", mode="lines"))
+            m.update_layout(title="MACD")
+            st.plotly_chart(m, use_container_width=True)
 
-st.markdown("---")
-st.markdown("**Objective 3 (DM vs EM):** Use the tabs with your selected DM/EM watchlists to compare KPIs, distributions, model AUC/F1, and backtest outcomes across regions.")
+        st.caption("Indicator table (last 10 rows)")
+        st.dataframe(ind.tail(10), use_container_width=True)
+
+# ---------- Portfolio KPIs Tab ----------
+with tabs[3]:
+    st.subheader("Portfolio KPIs")
+
+    # Build equal-weight daily returns across chosen symbols
+    aligned = []
+    for sym, df in panel.items():
+        if "Adj Close" in df.columns:
+            r = df["Adj Close"].pct_change().rename(sym)
+            aligned.append(r)
+    if not aligned:
+        st.warning("No returns available.")
+        st.stop()
+
+    returns = pd.concat(aligned, axis=1).dropna(how="all")
+    weights = np.ones(len(returns.columns)) / len(returns.columns)
+    port_ret = returns.fillna(0).dot(weights)
+
+    bench_ret = None
+    if bench:
+        try:
+            bhist = fetch_many([bench], period=period, interval=interval).get(bench, pd.DataFrame())
+            if not bhist.empty and "Adj Close" in bhist.columns:
+                bench_ret = bhist["Adj Close"].pct_change()
+        except Exception:
+            pass
+
+    k = compute_kpis(port_ret, benchmark=bench_ret)
+    st.markdown(humanize_kpis(k))
+
+    # Cumulative curves
+    cum = (1 + port_ret.fillna(0)).cumprod()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=cum.index, y=cum, name="Portfolio", mode="lines"))
+    if bench_ret is not None and len(bench_ret.dropna()):
+        bcum = (1 + bench_ret.fillna(0)).cumprod()
+        fig.add_trace(go.Scatter(x=bcum.index, y=bcum, name=bench, mode="lines"))
+    fig.update_layout(title="Cumulative Growth (rebased to 1)")
+    st.plotly_chart(fig, use_container_width=True)
+
+st.info("Tip: tweak windows & intervals in the sidebar to see how indicators and KPIs react.")
