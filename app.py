@@ -1,84 +1,147 @@
-import io
-import pandas as pd
+# app.py
 import streamlit as st
-import plotly.express as px
-from utils import prepare_timeseries, compute_returns, compute_kpis
-from eda import basic_profile, plot_price_with_bands, plot_rsi, plot_returns_hist, plot_corr
+import pandas as pd
+import numpy as np
 
-st.set_page_config(page_title="IBR Finance: ML-in-Finance EDA", layout="wide")
+from data import fetch_many
+from features import build_indicators, prepare_ml_frame, compute_kpis
+from modeling import train_and_score_models, backtest_from_proba
+from ui import (
+    kpi_row, price_with_bands, rsi_chart, macd_chart, returns_hist,
+    model_table, equity_curve_chart, corr_heatmap, info_note
+)
 
-st.title("📊 IBR Finance — Markets EDA Dashboard")
-st.caption("Focus: real-world effect (KPIs), model compatibility signals (indicators), and EM/DV markets readiness.")
+st.set_page_config(page_title="IBR Finance — ML & Markets", page_icon="📈", layout="wide")
 
-with st.sidebar:
-    st.header("Data")
-    src = st.radio("Choose data source", ["Upload CSV"], horizontal=True)
-    date_col = st.text_input("Date column name (optional)", value="")
-    price_col = st.text_input("Price column name", value="Adj Close")
-    rsi_window = st.number_input("RSI window", 5, 50, 14, 1)
-    periods_per_year = st.selectbox("Periods/year", [252, 365, 52, 12], index=0)
-    st.markdown("---")
-    st.header("About")
-    st.markdown("Objectives: 1) Real-world KPIs, 2) Model-readiness indicators, 3) Emerging-vs-Developed comparability.")
+# ---------------- SIDEBAR ----------------
+st.sidebar.title("⚙️ Controls")
 
-@st.cache_data(show_spinner=False)
-def _read_csv(file_bytes):
-    return pd.read_csv(io.BytesIO(file_bytes))
+markets = st.sidebar.selectbox(
+    "Market set",
+    ["Developed (DM)", "Emerging (EM)", "Custom"],
+    index=0
+)
 
-df = None
-uploaded = st.file_uploader("Upload a CSV with price data", type=["csv"])
-if uploaded is not None:
-    try:
-        raw = _read_csv(uploaded.getvalue())
-        df = prepare_timeseries(raw, date_col=date_col or None, price_col=price_col)
-        # Recompute RSI with chosen window if available price:
-        if price_col in df.columns:
-            from utils import rsi as _rsi
-            df["RSI"] = _rsi(df[price_col], window=rsi_window)
-    except Exception as e:
-        st.error(f"Could not parse file: {e}")
+DM_DEFAULT = ["SPY", "AAPL", "MSFT", "NVDA", "QQQ", "GLD"]
+EM_DEFAULT = ["NIFTYBEES.NS", "RELIANCE.NS", "TCS.NS", "ICICIBANK.NS", "HDFCBANK.NS", "KOTAKBANK.NS"]
 
-if df is None:
-    st.info("Upload a CSV to start. Expected columns: a date column + price (Adj Close or Close).")
+if markets == "Developed (DM)":
+    tickers = st.sidebar.text_input("Tickers (comma-separated)", ", ".join(DM_DEFAULT))
+elif markets == "Emerging (EM)":
+    tickers = st.sidebar.text_input("Tickers (comma-separated)", ", ".join(EM_DEFAULT))
+else:
+    tickers = st.sidebar.text_input("Tickers (comma-separated)", "SPY, AAPL, BTC-USD")
+
+period = st.sidebar.selectbox("Period", ["6mo", "1y", "2y", "5y", "10y", "max"], index=2)
+interval = st.sidebar.selectbox("Interval", ["1d", "1wk", "1mo"], index=0)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Indicators")
+rsi_win = st.sidebar.slider("RSI window", 5, 30, 14, 1)
+bb_win = st.sidebar.slider("Bollinger window", 10, 40, 20, 1)
+bb_std = st.sidebar.slider("Bollinger std", 1.0, 3.0, 2.0, 0.5)
+ema_fast = st.sidebar.slider("EMA fast", 5, 20, 12, 1)
+ema_slow = st.sidebar.slider("EMA slow", 15, 50, 26, 1)
+macd_sig = st.sidebar.slider("MACD signal", 5, 20, 9, 1)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("ML Target")
+horizon = st.sidebar.slider("Forward horizon (days)", 1, 30, 5, 1)
+threshold = st.sidebar.slider("Forward return threshold", -0.05, 0.05, 0.0, 0.005)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Backtest")
+prob_threshold = st.sidebar.slider("Long when Prob(Up) ≥", 0.1, 0.9, 0.5, 0.05)
+est_cost_bps = st.sidebar.slider("Transaction cost (bps per trade)", 0, 50, 5, 1)
+
+# ---------------- HEADER ----------------
+st.title("📊 IBR Finance — ML Applications in Finance (DM vs EM)")
+st.caption("No upload required • Live data via yfinance • EDA + ML + Backtest • Objectives-aligned")
+
+# ---------------- DATA ----------------
+symbols = [t.strip() for t in tickers.split(",") if t.strip()]
+with st.spinner("Fetching market data..."):
+    panel = fetch_many(symbols, period=period, interval=interval)
+
+if not panel:
+    st.error("No data fetched. Check tickers or internet access.")
     st.stop()
 
-# ---------- KPIs (Objective 1) ----------
-ret, px_series = compute_returns(df, price_col=price_col)
-k = compute_kpis(df, price_col=price_col, risk_free_annual=0.0, periods_per_year=periods_per_year)
+# ---------------- TABS PER TICKER ----------------
+tabs = st.tabs(symbols)
 
-kpi_cols = st.columns(6)
-kpi_cols[0].metric("Sharpe", f"{k['Sharpe']:.2f}" if pd.notna(k['Sharpe']) else "NA")
-kpi_cols[1].metric("CAGR", f"{k['CAGR']*100:.2f}%" if pd.notna(k['CAGR']) else "NA")
-kpi_cols[2].metric("Max Drawdown", f"{k['Max Drawdown']*100:.2f}%" if pd.notna(k['Max Drawdown']) else "NA")
-kpi_cols[3].metric("Hit Rate", f"{k['Hit Rate']*100:.2f}%" if pd.notna(k['Hit Rate']) else "NA")
-kpi_cols[4].metric("Ann Return", f"{k['Ann Return']*100:.2f}%" if pd.notna(k['Ann Return']) else "NA")
-kpi_cols[5].metric("Ann Vol", f"{k['Ann Vol']*100:.2f}%" if pd.notna(k['Ann Vol']) else "NA")
+for tab, sym in zip(tabs, symbols):
+    with tab:
+        df = panel.get(sym)
+        if df is None or df.empty:
+            st.warning(f"{sym}: no data.")
+            continue
 
-st.markdown("### Price & Bands (Model‑readiness signals)")
-st.plotly_chart(plot_price_with_bands(df, price_col=price_col), use_container_width=True)
+        # Indicators & EDA frame
+        df_ind = build_indicators(df,
+                                  rsi_window=rsi_win,
+                                  bb_window=bb_win,
+                                  bb_std=bb_std,
+                                  ema_fast=ema_fast,
+                                  ema_slow=ema_slow,
+                                  macd_signal=macd_sig)
 
-c1, c2 = st.columns([1,1])
-with c1:
-    st.markdown("### RSI")
-    st.plotly_chart(plot_rsi(df), use_container_width=True)
-with c2:
-    st.markdown("### Returns distribution")
-    st.plotly_chart(plot_returns_hist(ret), use_container_width=True)
+        # KPIs (Objective 1: real-world effect, baseline)
+        k = compute_kpis(df_ind)
+        kpi_row(k)
 
-# ---------- EDA Summary (Objective 2 & 3 context) ----------
-st.markdown("### EDA Overview")
-prof = basic_profile(df.select_dtypes(include="number"))
-st.dataframe(prof, height=320, use_container_width=True)
+        # Charts
+        c1, c2 = st.columns([2, 1], gap="large")
+        with c1:
+            st.plotly_chart(price_with_bands(df_ind), use_container_width=True)
+        with c2:
+            st.plotly_chart(rsi_chart(df_ind), use_container_width=True)
+            st.plotly_chart(macd_chart(df_ind), use_container_width=True)
 
-st.markdown("### Correlation heatmap (numeric features)")
-st.plotly_chart(plot_corr(df), use_container_width=True)
+        c3, c4 = st.columns([1, 1], gap="large")
+        with c3:
+            st.plotly_chart(returns_hist(df_ind), use_container_width=True)
+        with c4:
+            st.plotly_chart(corr_heatmap(df_ind), use_container_width=True)
 
-# ---------- Notes aligned to objectives ----------
-with st.expander("How this aligns to your objectives"):
-    st.markdown(
-        """
-- **Real‑world effect:** KPIs (Sharpe, CAGR, MDD, Hit‑Rate) are computed on your uploaded data with robust guards (no ambiguous truth comparisons).
-- **Model compatibility:** Indicators (RSI, SMA/EMA, Bollinger) + correlation give quick signal quality checks before RF/SVM/ANN.
-- **Emerging vs Developed:** Upload multiple assets/markets; compare KPI panels and distributions to discuss regional factors.
-        """
-    )
+        st.markdown("### 🤖 Model Comparison (RF • SVM • MLP) — Objective 2")
+        # ML frame (features + label)
+        ml_df = prepare_ml_frame(df_ind, horizon=horizon, threshold=threshold)
+        if ml_df is None or ml_df.empty or ml_df["Target"].nunique() < 2:
+            info_note("Not enough labeled data after preprocessing (need both classes 0/1). Adjust horizon/threshold or choose a longer period.")
+            continue
+
+        # Train & Evaluate (time-aware split)
+        with st.spinner("Training models..."):
+            results, preds = train_and_score_models(ml_df)
+
+        st.plotly_chart(model_table(results), use_container_width=True)
+
+        st.markdown("### 📈 Backtest — Objective 1 (Real-world effect from model output)")
+        # Choose the best validation AUC model for backtest
+        best = results.sort_values("Val_AUC", ascending=False).iloc[0]
+        best_name = best["Model"]
+        proba_test = preds[best_name]["test_proba"]
+        price_test = preds[best_name]["price_test"]
+        dates_test = preds[best_name]["index_test"]
+
+        # Backtest from probas
+        bt = backtest_from_proba(
+            price=price_test, proba=proba_test, index=dates_test,
+            prob_threshold=prob_threshold, cost_bps=est_cost_bps
+        )
+
+        # Equity curve and metrics
+        st.plotly_chart(equity_curve_chart(bt["equity"]), use_container_width=True)
+
+        bt_c1, bt_c2, bt_c3, bt_c4 = st.columns(4)
+        bt_c1.metric("CAGR", f"{bt['CAGR']:.2%}" if np.isfinite(bt['CAGR']) else "—")
+        bt_c2.metric("Sharpe", f"{bt['Sharpe']:.2f}" if np.isfinite(bt['Sharpe']) else "—")
+        bt_c3.metric("Sortino", f"{bt['Sortino']:.2f}" if np.isfinite(bt['Sortino']) else "—")
+        bt_c4.metric("Max Drawdown", f"{bt['MaxDD']:.2%}" if np.isfinite(bt['MaxDD']) else "—")
+
+        st.caption(f"Backtest based on best validation AUC model: **{best_name}**. "
+                   f"Long when Prob(Up) ≥ {prob_threshold:.2f}, cost = {est_cost_bps} bps/trade.")
+
+st.markdown("---")
+st.markdown("**Objective 3 (DM vs EM):** Use the tabs with your selected DM/EM watchlists to compare KPIs, distributions, model AUC/F1, and backtest outcomes across regions.")
