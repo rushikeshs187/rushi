@@ -1,187 +1,132 @@
-# utils.py
-from __future__ import annotations
-import io
-from datetime import date, timedelta
-
 import numpy as np
 import pandas as pd
 
-# ----------------------------
-# IO helpers
-# ----------------------------
-def load_csv(file, date_col="Date") -> tuple[pd.DataFrame | None, str | None]:
-    """Load a CSV, coerce date column, set DatetimeIndex, normalize common OHLC names."""
-    try:
-        df = pd.read_csv(file)
-        if date_col not in df.columns:
-            return None, f"Date column '{date_col}' not found in CSV."
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.dropna(subset=[date_col]).sort_values(date_col)
-        df = df.set_index(date_col)
+# ---------- Safe helpers ----------
 
-        # Normalize common OHLC names (case/spacing tolerant)
-        rename_map = {}
-        for c in df.columns:
-            key = c.strip()
-            if key.lower() in {"open","high","low","close","adj close","volume"}:
-                # Title-case except Adj Close capitalization
-                if key.lower() == "adj close":
-                    rename_map[c] = "Adj Close"
-                else:
-                    rename_map[c] = key.title()
-        if rename_map:
-            df = df.rename(columns=rename_map)
-
-        return df, None
-    except Exception as e:
-        return None, f"Failed to read CSV: {e}"
-
-def fetch_ticker_history(ticker: str, years: int = 3) -> tuple[pd.DataFrame | None, str | None]:
-    """Fetch daily history via yfinance. Requires yfinance in requirements."""
-    try:
-        import yfinance as yf
-    except Exception:
-        return None, "yfinance is not installed. Add it to requirements.txt"
-
-    try:
-        end = date.today()
-        start = end - timedelta(days=365 * years + 7)
-        data = yf.download(ticker, start=start, end=end, auto_adjust=False, progress=False)
-        if data is None or data.empty:
-            return None, f"No data returned for '{ticker}'. Check the symbol."
-        data.index = pd.to_datetime(data.index)
-
-        # Ensure expected columns exist
-        for col in ["Open","High","Low","Close","Adj Close","Volume"]:
-            if col not in data.columns:
-                data[col] = np.nan
-        return data, None
-    except Exception as e:
-        return None, f"Failed to fetch {ticker}: {e}"
-
-# ----------------------------
-# Indicators
-# ----------------------------
-def _sma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window).mean()
-
-def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0.0)).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def _bollinger(series: pd.Series, window: int = 20, n_std: float = 2.0):
-    mid = series.rolling(window).mean()
-    std = series.rolling(window).std(ddof=0)
-    upper = mid + n_std * std
-    lower = mid - n_std * std
-    return mid, upper, lower
-
-def add_technical_indicators(df: pd.DataFrame, sma=True, rsi=True, bb=True) -> pd.DataFrame:
-    out = df.copy()
-    # If duplicate 'Close' columns exist, reduce to first one
-    if "Close" not in out.columns:
-        return out
-    s = out["Close"]
-    if isinstance(s, pd.DataFrame):
-        s = s.iloc[:, 0]
-        out = out.drop(columns=["Close"]).assign(Close=s)
-
-    close = pd.to_numeric(out["Close"], errors="coerce")
-    out["Close"] = close
-
-    if sma:
-        out["SMA20"] = _sma(close, 20)
-        out["SMA50"] = _sma(close, 50)
-    if rsi:
-        out["RSI"] = _rsi(close, 14)
-    if bb:
-        m, u, l = _bollinger(close, 20, 2.0)
-        out["BB_M"], out["BB_U"], out["BB_L"] = m, u, l
-    return out
-
-# ----------------------------
-# KPIs & returns (robust)
-# ----------------------------
-def _first_close_series(df: pd.DataFrame) -> pd.Series:
-    """Return a single numeric Close series even if duplicate 'Close' columns are present."""
-    if "Close" not in df.columns:
-        raise KeyError("Column 'Close' not found.")
-    s = df["Close"]
-    if isinstance(s, pd.DataFrame):
-        s = s.iloc[:, 0]
-    s = pd.to_numeric(s, errors="coerce")
-    s = s.dropna().sort_index()
-    return s
-
-def compute_kpis(df: pd.DataFrame) -> dict:
-    """
-    Robust KPIs: last price, D1, MTD, YTD, Sharpe (daily, ~252).
-    Fixes the 'truth value of a Series is ambiguous' issue by ensuring scalars.
-    """
-    out = {"price_last": np.nan, "d1": np.nan, "mtd": np.nan, "ytd": np.nan, "sharpe": np.nan}
-
-    # Ensure DatetimeIndex if possible
-    if not isinstance(df.index, pd.DatetimeIndex):
+def _to_datetime_index(df, date_col=None):
+    if date_col and date_col in df.columns:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=True)
+        df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+    elif not isinstance(df.index, pd.DatetimeIndex):
+        # last resort: try to parse index
         try:
-            tmp = df.copy()
-            tmp.index = pd.to_datetime(tmp.index, errors="coerce")
-            tmp = tmp[~tmp.index.isna()]
-            df = tmp
+            df.index = pd.to_datetime(df.index, errors="coerce", utc=True)
+            df = df.dropna(subset=[df.index.name]).sort_index()
         except Exception:
-            return out
+            pass
+    return df
 
-    # Get a single, numeric Close series
-    try:
-        s = _first_close_series(df)
-    except Exception:
-        return out
+def _ensure_float(series):
+    return pd.to_numeric(series, errors="coerce")
 
-    if s.empty:
-        return out
+def compute_returns(df, price_col="Adj Close"):
+    if price_col not in df.columns:
+        # try common fallbacks
+        for c in ["Close", "close", "Adj_Close", "adj_close"]:
+            if c in df.columns:
+                price_col = c
+                break
+    if price_col not in df.columns:
+        raise ValueError("Could not find a price column (expected 'Adj Close' or 'Close').")
 
-    s = s.sort_index()
-    out["price_last"] = float(s.iloc[-1])
+    px = _ensure_float(df[price_col]).copy()
+    ret = px.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return ret.rename("returns"), px.rename("price")
 
-    # D1
-    if len(s) >= 2 and s.iloc[-2] not in (0, np.nan):
-        out["d1"] = float((s.iloc[-1] / s.iloc[-2] - 1) * 100.0)
+# ---------- Indicators ----------
 
-    # MTD / YTD
-    last_dt = s.index[-1]
-    try:
-        same_month = s[s.index.to_period("M") == last_dt.to_period("M")]
-        if not same_month.empty and same_month.iloc[0] != 0:
-            out["mtd"] = float((s.iloc[-1] / same_month.iloc[0] - 1) * 100.0)
-    except Exception:
-        pass
+def rsi(series, window=14):
+    s = _ensure_float(series).copy()
+    delta = s.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    # Avoid division by zero by adding small epsilon
+    roll_up = up.ewm(alpha=1/window, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/window, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val.rename("RSI")
 
-    try:
-        same_year = s[s.index.year == last_dt.year]
-        if not same_year.empty and same_year.iloc[0] != 0:
-            out["ytd"] = float((s.iloc[-1] / same_year.iloc[0] - 1) * 100.0)
-    except Exception:
-        pass
+def sma(series, window=20):
+    return _ensure_float(series).rolling(window).mean().rename(f"SMA_{window}")
 
-    # Sharpe (daily)
-    ret = s.pct_change().dropna()
-    if not ret.empty:
-        std = float(ret.std(ddof=0))  # scalar
-        if np.isfinite(std) and std > 0:
-            mean = float(ret.mean())
-            daily_sharpe = mean / std
-            out["sharpe"] = float(daily_sharpe * np.sqrt(252.0))
+def ema(series, window=20):
+    return _ensure_float(series).ewm(span=window, adjust=False).mean().rename(f"EMA_{window}")
 
-    return out
+def bollinger(series, window=20, n_std=2):
+    m = sma(series, window)
+    s = _ensure_float(series).rolling(window).std(ddof=0)
+    upper = (m + n_std * s).rename("BB_upper")
+    lower = (m - n_std * s).rename("BB_lower")
+    return m.rename("BB_mid"), upper, lower
 
-def to_returns(df: pd.DataFrame) -> pd.DataFrame:
-    """Safe returns DataFrame with a single 'Returns' column."""
-    try:
-        s = _first_close_series(df)
-    except Exception:
-        return pd.DataFrame(columns=["Returns"])
-    r = s.pct_change().rename("Returns")
-    return pd.DataFrame(r)
+# ---------- KPIs (robust) ----------
+
+def max_drawdown(cumret):
+    peak = cumret.cummax()
+    dd = (cumret / peak) - 1.0
+    return dd.min()
+
+def sharpe_ratio(returns, risk_free=0.0, periods_per_year=252):
+    r = _ensure_float(returns)
+    if r.std(ddof=0) == 0 or r.empty:
+        return np.nan
+    excess = r - (risk_free / periods_per_year)
+    ann_ret = excess.mean() * periods_per_year
+    ann_vol = r.std(ddof=0) * np.sqrt(periods_per_year)
+    if ann_vol == 0:
+        return np.nan
+    return ann_ret / ann_vol
+
+def cagr(returns, periods_per_year=252):
+    r = _ensure_float(returns)
+    if r.empty:
+        return np.nan
+    cum = (1 + r).cumprod()
+    n_years = len(r) / periods_per_year
+    if n_years <= 0:
+        return np.nan
+    return cum.iloc[-1]**(1/n_years) - 1
+
+def hit_rate(returns):
+    r = _ensure_float(returns)
+    if r.empty:
+        return np.nan
+    return (r > 0).sum() / len(r)
+
+def compute_kpis(df, price_col="Adj Close", risk_free_annual=0.0, periods_per_year=252):
+    """
+    Robust KPI calc. Returns a dict; never raises the ambiguous truth ValueError.
+    """
+    returns, price = compute_returns(df, price_col)
+    if returns.empty:
+        return {
+            "Sharpe": np.nan, "CAGR": np.nan, "Max Drawdown": np.nan,
+            "Hit Rate": np.nan, "Ann Return": np.nan, "Ann Vol": np.nan
+        }
+    cum = (1 + returns).cumprod()
+    k = {}
+    k["Sharpe"] = sharpe_ratio(returns, risk_free=risk_free_annual, periods_per_year=periods_per_year)
+    k["CAGR"] = cagr(returns, periods_per_year=periods_per_year)
+    k["Max Drawdown"] = max_drawdown(cum)
+    k["Hit Rate"] = hit_rate(returns)
+    k["Ann Return"] = returns.mean() * periods_per_year
+    k["Ann Vol"] = returns.std(ddof=0) * (periods_per_year ** 0.5)
+    return k
+
+# ---------- Preprocess entrypoint ----------
+
+def prepare_timeseries(df, date_col=None, price_col="Adj Close"):
+    df = df.copy()
+    df = _to_datetime_index(df, date_col)
+    # Ensure numeric price
+    if price_col in df.columns:
+        df[price_col] = _ensure_float(df[price_col])
+    # Technicals
+    _, price = compute_returns(df, price_col)
+    df["RSI"] = rsi(price)
+    df["SMA_20"] = sma(price, 20)
+    df["EMA_20"] = ema(price, 20)
+    bb_mid, bb_u, bb_l = bollinger(price, 20, 2)
+    df["BB_mid"], df["BB_upper"], df["BB_lower"] = bb_mid, bb_u, bb_l
+    return df
