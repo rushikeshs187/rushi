@@ -22,22 +22,18 @@ st.set_page_config(
 )
 
 st.title("📈 Finance EDA & Indicators Dashboard")
-st.caption("Auto-fetching data. No uploads required.")
+st.caption("Auto-fetching data • No uploads required • EDA + Indicators + Portfolio KPIs")
 
 # ---------- Sidebar Controls ----------
 with st.sidebar:
     st.header("⚙️ Controls")
 
-    default_symbols = os.environ.get(
-        "DEFAULT_SYMBOLS",
-        "AAPL,MSFT,GOOGL,AMZN,NVDA"
-    )
-
+    default_symbols = os.environ.get("DEFAULT_SYMBOLS", "AAPL,MSFT,GOOGL,AMZN,NVDA")
     symbols = st.text_input("Symbols (comma-separated)", default_symbols).upper()
     symbols = [s.strip() for s in symbols.split(",") if s.strip()]
 
-    period = st.selectbox("History Period", allowed_periods(), index=6)  # 5y default
-    interval = st.selectbox("Data Interval", allowed_intervals(), index=4)  # 1d default
+    period = st.selectbox("History Period", allowed_periods(), index=6)   # "5y"
+    interval = st.selectbox("Data Interval", allowed_intervals(), index=4)  # "1d"
 
     st.divider()
     st.subheader("Indicators")
@@ -56,15 +52,16 @@ with st.sidebar:
 
 # ---------- Fetch Data ----------
 today = ensure_tz_safe_today()
+
 try:
+    # returns Dict[str, DataFrame]
     panel = fetch_many(symbols, period=period, interval=interval)
 except Exception as e:
     st.error(f"Data fetch failed: {e}")
     st.stop()
 
 if not panel:
-    st.warning("No data could be retrieved for the requested symbols. "
-               "Try changing period/interval or symbols.")
+    st.warning("No data could be retrieved for the requested symbols. Try changing period/interval or symbols.")
     st.stop()
 
 tabs = st.tabs(["Overview", "Per-Symbol EDA", "Indicators", "Portfolio KPIs"])
@@ -73,27 +70,32 @@ tabs = st.tabs(["Overview", "Per-Symbol EDA", "Indicators", "Portfolio KPIs"])
 with tabs[0]:
     st.subheader("Summary Snapshot")
 
-    # Build a small table of last price and YTD/1Y returns for all tickers
     rows = []
     for sym, df in panel.items():
         if df.empty or "Adj Close" not in df.columns:
             continue
         last_px = float(df["Adj Close"].dropna().iloc[-1]) if df["Adj Close"].dropna().size else np.nan
-        # returns
-        daily = safe_pct_change(df["Adj Close"]).dropna()
+
+        # YTD & 1Y
         ytd = np.nan
         one_year = np.nan
         try:
-            ytd = (df["Adj Close"].iloc[-1] / df["Adj Close"][df.index.year == today.year].iloc[0] - 1) if (df.index.year == today.year).any() else np.nan
+            if (df.index.year == today.year).any():
+                first_this_year = df["Adj Close"][df.index.year == today.year].iloc[0]
+                if pd.notna(first_this_year) and first_this_year != 0:
+                    ytd = df["Adj Close"].iloc[-1] / first_this_year - 1
         except Exception:
             pass
-        if len(df) > 252:
+        if len(df) > 252 and pd.notna(df["Adj Close"].iloc[-252]) and df["Adj Close"].iloc[-252] != 0:
             one_year = float(df["Adj Close"].iloc[-1] / df["Adj Close"].iloc[-252] - 1)
         rows.append({"Symbol": sym, "Last Price": last_px, "YTD": ytd, "1Y": one_year})
 
     if rows:
         snap = pd.DataFrame(rows).set_index("Symbol")
-        st.dataframe(snap.style.format({"Last Price": "{:,.2f}", "YTD": "{:.2%}", "1Y": "{:.2%}"}), use_container_width=True)
+        st.dataframe(
+            snap.style.format({"Last Price": "{:,.2f}", "YTD": "{:.2%}", "1Y": "{:.2%}"}),
+            use_container_width=True
+        )
     else:
         st.info("No summary available.")
 
@@ -115,7 +117,8 @@ with tabs[1]:
     if df.empty or "Adj Close" not in df.columns:
         st.warning("Selected symbol has no data.")
     else:
-        colA, colB = st.columns([2, 1], vertical_alignment="top")
+        # NOTE: avoid vertical_alignment kw (older Streamlit)
+        colA, colB = st.columns([2, 1])
 
         with colA:
             pfig = go.Figure()
@@ -133,6 +136,7 @@ with tabs[1]:
                 st.plotly_chart(rfig, use_container_width=True)
 
         with colB:
+            st.markdown("")  # small spacer to pin top on older Streamlit
             st.write("Quick Stats")
             dd = compute_drawdown(df["Adj Close"])
             metrics = {
@@ -208,7 +212,6 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Portfolio KPIs")
 
-    # Build equal-weight daily returns across chosen symbols
     aligned = []
     for sym, df in panel.items():
         if "Adj Close" in df.columns:
@@ -225,9 +228,10 @@ with tabs[3]:
     bench_ret = None
     if bench:
         try:
-            bhist = fetch_many([bench], period=period, interval=interval).get(bench, pd.DataFrame())
-            if not bhist.empty and "Adj Close" in bhist.columns:
-                bench_ret = bhist["Adj Close"].pct_change()
+            bpanel = fetch_many([bench], period=period, interval=interval)
+            bdf = bpanel.get(bench, pd.DataFrame())
+            if not bdf.empty and "Adj Close" in bdf.columns:
+                bench_ret = bdf["Adj Close"].pct_change()
         except Exception:
             pass
 
