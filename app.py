@@ -1,3 +1,4 @@
+# app.py
 import sys
 from datetime import date, timedelta
 
@@ -33,6 +34,12 @@ st.set_page_config(
 st.sidebar.title("📁 Data source")
 source = st.sidebar.radio("Choose data source:", ["Upload CSV", "Yahoo Finance (yfinance)"])
 
+uploaded = None
+date_col = None
+price_col = None
+ticker = None
+years = None
+
 if source == "Upload CSV":
     uploaded = st.sidebar.file_uploader("Upload a CSV with Date and Close (OHLC optional)", type=["csv"])
     date_col = st.sidebar.text_input("Date column name", value="Date")
@@ -66,7 +73,7 @@ def _load_data(source, uploaded, date_col, price_col, ticker, years):
         df, err = load_csv(uploaded, date_col=date_col)
         if err:
             return None, err
-        # Standardize column naming
+        # Standardize price column name to 'Close'
         if price_col not in df.columns:
             return None, f"Couldn't find price column '{price_col}' in the file."
         if "Close" not in df.columns:
@@ -76,11 +83,14 @@ def _load_data(source, uploaded, date_col, price_col, ticker, years):
         df, err = fetch_ticker_history(ticker, years)
         return df, err
 
-df, err = _load_data(source, uploaded if source=="Upload CSV" else None, 
-                     date_col if source=="Upload CSV" else None, 
-                     price_col if source=="Upload CSV" else None,
-                     ticker if source=="Yahoo Finance (yfinance)" else None, 
-                     years if source=="Yahoo Finance (yfinance)" else None)
+df, err = _load_data(
+    source,
+    uploaded if source == "Upload CSV" else None,
+    date_col if source == "Upload CSV" else None,
+    price_col if source == "Upload CSV" else None,
+    ticker if source == "Yahoo Finance (yfinance)" else None,
+    years if source == "Yahoo Finance (yfinance)" else None,
+)
 
 if err:
     st.warning(err)
@@ -104,10 +114,11 @@ with left:
 with mid:
     k = compute_kpis(df)
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Price (last)", f"{k['price_last']:.2f}", f"{k['d1']:+.2f}% D1")
-    c2.metric("MTD", f"{k['mtd']:+.2f}%")
-    c3.metric("YTD", f"{k['ytd']:+.2f}%")
-    c4.metric("Sharpe (daily≈252)", f"{k['sharpe']:.2f}")
+    last_str = f"{k['price_last']:.2f}" if np.isfinite(k['price_last']) else "—"
+    c1.metric("Price (last)", last_str, f"{k['d1']:+.2f}% D1" if np.isfinite(k['d1']) else None)
+    c2.metric("MTD", f"{k['mtd']:+.2f}%" if np.isfinite(k['mtd']) else "—")
+    c3.metric("YTD", f"{k['ytd']:+.2f}%" if np.isfinite(k['ytd']) else "—")
+    c4.metric("Sharpe (daily≈252)", f"{k['sharpe']:.2f}" if np.isfinite(k['sharpe']) else "—")
 
 with right:
     st.write("")
@@ -122,7 +133,9 @@ st.subheader("Price & Indicators")
 def _plot_main(df):
     if _HAS_PLOTLY:
         fig = go.Figure()
+        # Price
         fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", mode="lines"))
+        # Indicators
         if show_sma and "SMA20" in df and "SMA50" in df:
             fig.add_trace(go.Scatter(x=df.index, y=df["SMA20"], name="SMA20", mode="lines"))
             fig.add_trace(go.Scatter(x=df.index, y=df["SMA50"], name="SMA50", mode="lines"))
@@ -135,7 +148,8 @@ def _plot_main(df):
         fig.update_layout(height=500, legend_title_text="Legend", margin=dict(l=10,r=10,t=10,b=10))
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.line_chart(df[["Close"] + [c for c in ["SMA20","SMA50","BB_U","BB_M","BB_L"] if c in df.columns]])
+        cols = ["Close"] + [c for c in ["SMA20","SMA50","BB_U","BB_M","BB_L"] if c in df.columns]
+        st.line_chart(df[cols])
 
 _plot_main(df)
 
@@ -145,7 +159,7 @@ _plot_main(df)
 if show_rsi and "RSI" in df:
     st.subheader("RSI (14)")
     if _HAS_PLOTLY:
-        rfig = px.line(df, x=df.index, y="RSI")
+        rfig = px.line(df, x=df.index, y="RSI", title=None)
         rfig.add_hrect(y0=30, y1=70, line_width=0, fillcolor="lightgray", opacity=0.2)
         rfig.update_layout(height=250, margin=dict(l=10,r=10,t=10,b=10))
         st.plotly_chart(rfig, use_container_width=True)
@@ -153,19 +167,23 @@ if show_rsi and "RSI" in df:
         st.line_chart(df[["RSI"]])
 
 # =========================
-# Returns & simple model stub
+# Returns & simple distribution
 # =========================
-st.subheader("Returns & Simple Signals")
+st.subheader("Returns & Distribution")
 ret_df = to_returns(df)
 c1, c2 = st.columns(2)
 with c1:
-    st.caption("Daily returns")
+    st.caption("Daily returns (last 10)")
     st.dataframe(ret_df.tail(10))
 with c2:
     if _HAS_PLOTLY:
-        h = px.histogram(ret_df.dropna(), x="Returns", nbins=50, title="Return distribution")
-        h.update_layout(height=300, margin=dict(l=10,r=10,t=35,b=10), title_x=0.2)
-        st.plotly_chart(h, use_container_width=True)
+        clean = ret_df.dropna()
+        if not clean.empty:
+            h = px.histogram(clean, x="Returns", nbins=50, title="Return distribution")
+            h.update_layout(height=300, margin=dict(l=10,r=10,t=35,b=10), title_x=0.2)
+            st.plotly_chart(h, use_container_width=True)
+        else:
+            st.info("Not enough returns to plot a histogram yet.")
     else:
         st.bar_chart(ret_df.tail(60)["Returns"])
 
@@ -176,3 +194,5 @@ st.download_button(
     file_name="enriched_market_data.csv",
     mime="text/csv",
 )
+
+st.caption("If Plotly isn't installed, charts fall back to Streamlit's native charts.")
