@@ -1,32 +1,43 @@
+from __future__ import annotations
 import numpy as np
 import pandas as pd
-from math import sqrt
 
-def kpis_from_returns(ret: pd.Series, trading_days: int = 252) -> dict:
-    r = ret.dropna()
-    if r.empty:
-        return {"cagr": 0.0, "sharpe": 0.0, "sortino": 0.0, "max_drawdown": 0.0}
+def annualize_return(daily_ret: pd.Series) -> float:
+    m = daily_ret.mean()
+    return (1 + m) ** 252 - 1
 
-    # CAGR
-    cum = (1 + r).cumprod()
-    n_years = len(r) / trading_days if trading_days > 0 else 1
-    cagr = (cum.iloc[-1] ** (1 / max(n_years, 1e-9))) - 1
+def sharpe_ratio(daily_ret: pd.Series, rf: float = 0.0) -> float:
+    if daily_ret.std(ddof=0) == 0 or daily_ret.dropna().empty:
+        return 0.0
+    er = daily_ret - rf/252
+    return np.sqrt(252) * er.mean() / er.std(ddof=0)
 
-    # Sharpe (risk-free ~ 0)
-    sharpe = (r.mean() / (r.std(ddof=0) + 1e-12)) * sqrt(trading_days)
+def sortino_ratio(daily_ret: pd.Series, rf: float = 0.0) -> float:
+    downside = daily_ret[daily_ret < 0]
+    if downside.std(ddof=0) == 0 or daily_ret.dropna().empty:
+        return 0.0
+    er = daily_ret - rf/252
+    return np.sqrt(252) * er.mean() / downside.std(ddof=0)
 
-    # Sortino (downside deviation)
-    downside = r.copy()
-    downside[downside > 0] = 0
-    dd = downside.std(ddof=0)
-    sortino = (r.mean() / (dd + 1e-12)) * sqrt(trading_days)
+def max_drawdown(equity_curve: pd.Series) -> float:
+    if equity_curve.dropna().empty:
+        return 0.0
+    roll_max = equity_curve.cummax()
+    dd = equity_curve/roll_max - 1.0
+    return dd.min()
 
-    # Max Drawdown
-    roll_max = cum.cummax()
-    dd_series = (cum / roll_max) - 1.0
-    max_dd = dd_series.min()
+def hit_rate(pred: pd.Series, actual: pd.Series) -> float:
+    ok = (pred == actual).astype(float)
+    return float(ok.mean()) if not ok.empty else 0.0
 
-    return {"cagr": float(cagr), "sharpe": float(sharpe), "sortino": float(sortino), "max_drawdown": float(max_dd)}
+def to_direction(x: pd.Series) -> pd.Series:
+    return (x > 0).astype(int)
 
-def format_kpi(x: float) -> str:
-    return f"{x*100:.2f}%"
+def safe_pct(x: float, digits: int = 2) -> str:
+    try:
+        return f"{x*100:.{digits}f}%"
+    except Exception:
+        return "—"
+
+def non_empty(df: pd.DataFrame) -> bool:
+    return isinstance(df, pd.DataFrame) and not df.empty and df.shape[0] > 5
