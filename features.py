@@ -1,65 +1,71 @@
+from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-def _rsi(close: pd.Series, window: int = 14) -> pd.Series:
-    close = pd.to_numeric(close, errors="coerce")
-    delta = close.diff()
-    up = (delta.clip(lower=0)).ewm(alpha=1/window, adjust=False).mean()
+def _rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0).ewm(alpha=1/window, adjust=False).mean()
     down = (-delta.clip(upper=0)).ewm(alpha=1/window, adjust=False).mean()
     rs = up / (down.replace(0, np.nan))
     rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return rsi.fillna(50)
 
-def _ema(s: pd.Series, span: int) -> pd.Series:
-    s = pd.to_numeric(s, errors="coerce")
-    return s.ewm(span=span, adjust=False).mean()
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
 
-def _sma(s: pd.Series, win: int) -> pd.Series:
-    s = pd.to_numeric(s, errors="coerce")
-    return s.rolling(win, min_periods=max(2, win//2)).mean()
+def _sma(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window).mean()
 
-def build_indicators(
-    df: pd.DataFrame,
-    rsi_window: int = 14,
-    ema_fast: int = 12,
-    ema_slow: int = 26,
-    macd_signal: int = 9,
-    bb_window: int = 20,
-    bb_std: float = 2.0,
-) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    out = df.copy()
-    # Ensure numeric
-    for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-    out["Return"] = out["Close"].pct_change()
-    out["LogRet"] = np.log(out["Close"]).diff()
+def _bbands(series: pd.Series, window: int = 20, num_std: float = 2.0):
+    ma = _sma(series, window)
+    sd = series.rolling(window).std(ddof=0)
+    upper = ma + num_std*sd
+    lower = ma - num_std*sd
+    return upper, ma, lower
 
-    # EMAs
-    out["EMA_Fast"] = _ema(out["Close"], ema_fast)
-    out["EMA_Slow"] = _ema(out["Close"], ema_slow)
+def _macd(series: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast = _ema(series, fast)
+    ema_slow = _ema(series, slow)
+    macd = ema_fast - ema_slow
+    sig = _ema(macd, signal)
+    hist = macd - sig
+    return macd, sig, hist
 
-    # MACD
-    macd = out["EMA_Fast"] - out["EMA_Slow"]
-    sig = macd.ewm(span=macd_signal, adjust=False).mean()
-    out["MACD"] = macd
-    out["MACD_Signal"] = sig
-    out["MACD_Hist"] = macd - sig
+def build_features(df: pd.DataFrame, by_symbol: bool = True) -> pd.DataFrame:
+    """Add returns + TA features per symbol. Expects columns: Symbol, Price, Volume."""
+    if df.empty: 
+        return df
+    out = []
+    for sym, g in df.groupby("Symbol"):
+        g = g.sort_index().copy()
+        px = pd.to_numeric(g["Price"], errors="coerce")
+        vol = pd.to_numeric(g["Volume"], errors="coerce")
+        ret = px.pct_change()
+        g["Ret1"] = ret
+        g["Ret5"] = px.pct_change(5)
+        g["VolChg"] = vol.pct_change().replace([np.inf, -np.inf], np.nan)
 
-    # RSI
-    out["RSI"] = _rsi(out["Close"], window=rsi_window)
-
-    # Bollinger
-    mid = _sma(out["Close"], bb_window)
-    std = out["Close"].rolling(bb_window, min_periods=max(2, bb_window//2)).std()
-    out["BB_Mid"] = mid
-    out["BB_Upper"] = mid + bb_std * std
-    out["BB_Lower"] = mid - bb_std * std
-
-    # SMAs for crossover strategy convenience
-    out["SMA_Fast"] = _sma(out["Close"], max(5, min(200, 20)))
-    out["SMA_Slow"] = _sma(out["Close"], max(10, min(400, 50)))
-
-    return out.dropna(how="all")
+        # momentum/mean reversion
+        g["SMA20"] = _sma(px, 20)
+        g["SMA50"] = _sma(px, 50)
+        g["EMA12"] = _ema(px, 12)
+        g["EMA26"] = _ema(px, 26)
+        macd, macd_sig, macd_hist = _macd(px)
+        g["MACD"] = macd
+        g["MACDsig"] = macd_sig
+        g["MACDhist"] = macd_hist
+        g["RSI14"] = _rsi(px, 14)
+        bbU, bbM, bbL = _bbands(px, 20, 2.0)
+        g["BBU"] = bbU
+        g["BBM"] = bbM
+        g["BBL"] = bbL
+        # rolling vol
+        g["Volatility20"] = g["Ret1"].rolling(20).std(ddof=0)
+        # lags for autocorrelation
+        for k in (1,2,3,5,10):
+            g[f"Ret1_lag{k}"] = g["Ret1"].shift(k)
+        # target: next-day direction (1 up, 0 down/flat)
+        g["TargetNextUp"] = (g["Ret1"].shift(-1) > 0).astype(int)
+        out.append(g)
+    f = pd.concat(out).dropna(subset=["Price"])
+    return f
