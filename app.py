@@ -1,571 +1,662 @@
-# app.py
-# Streamlit EDA + ML comparison dashboard for financial markets
-# Models: RandomForest (RF), Support Vector Machine (SVM), Artificial Neural Network (MLP)
-# Data: auto-fetched from Yahoo via yfinance (no file uploads needed)
+# GTM Global Trade & Logistics Dashboard — Sri Lanka Focus
+# Live trade (UN Comtrade), FX, Landed Cost, Route & Lead Time (map),
+# Emissions, Presets, Scenario Saver, Packing
+# + NEW: Live flights (OpenSky), Live road ETA (OpenRouteService optional), Live weather risk (Open-Meteo)
 
-# ---------------------------
-# BOOTSTRAP MISSING PACKAGES (so the app still runs if requirements are incomplete)
-# ---------------------------
-def _ensure(pkgs):
-    import importlib, sys, subprocess
-    for name, pip_name in pkgs:
-        try:
-            importlib.import_module(name)
-        except ModuleNotFoundError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+import io, os, json, math, requests, pandas as pd, numpy as np, streamlit as st
+import folium
+from streamlit_folium import st_folium
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 
-_ensure([
-    ("streamlit", "streamlit>=1.38"),
-    ("pandas", "pandas>=1.5"),
-    ("numpy", "numpy>=1.23"),
-    ("yfinance", "yfinance>=0.2.40"),
-    ("plotly", "plotly>=5.24"),
-    ("sklearn", "scikit-learn>=1.3"),
-])
+# Optional charts
+try:
+    import plotly.express as px
+except Exception:
+    px = None
 
-# ---------------------------
-# IMPORTS
-# ---------------------------
-import os
-import math
-import time
-import numpy as np
-import pandas as pd
-import yfinance as yf
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
+st.set_page_config(page_title="GTM — Global Trade & Logistics (Sri Lanka)", layout="wide", page_icon="📦")
 
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, confusion_matrix
-)
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.svm import SVC
-from sklearn.neural_network import MLPClassifier
+# =================== THEME & SETTINGS ===================
+def ensure_defaults():
+    st.session_state.setdefault("theme", "Light")
+    st.session_state.setdefault("compact", False)
+    st.session_state.setdefault("d_hs", "300431")
+    st.session_state.setdefault("d_incoterm", "CIF")
+    st.session_state.setdefault("d_fob", 20000.0)
+    st.session_state.setdefault("d_freight", 2500.0)
+    st.session_state.setdefault("d_ins_pct", 1.0)
+    st.session_state.setdefault("d_ins_base", "FOB")
+    st.session_state.setdefault("d_duty_pct", 0.0)
+    st.session_state.setdefault("d_vat_pct", 8.0)
+    st.session_state.setdefault("d_broker", 300.0)
+    st.session_state.setdefault("d_dray", 120.0)
+    st.session_state.setdefault("d_fx_note", "ISFTA concession may apply — verify on MACMAP")
+    st.session_state.setdefault("scenarios", [])
+ensure_defaults()
 
-# ---------------------------
-# UI CONFIG
-# ---------------------------
-st.set_page_config(
-    page_title="IBR Finance — EDA & ML Model Comparison",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+def render_css(theme="Light", compact=False):
+    if theme == "Light":
+        bg, panel, ink, muted, border = "#f7f9fc", "#ffffff", "#0f172a", "#526581", "#e6ebf2"
+        primary, accent = "#2563eb", "#7c3aed"
+        card_grad = "linear-gradient(180deg, rgba(255,255,255,.98), rgba(255,255,255,.98))"
+        hero_grad = ("radial-gradient(1200px 400px at 0% -10%, rgba(37,99,235,.10), transparent 60%),"
+                     "radial-gradient(1200px 400px at 100% 110%, rgba(124,58,237,.08), transparent 60%),"
+                     "linear-gradient(180deg, rgba(255,255,255,.98), rgba(255,255,255,.98))")
+        kpi_bg, kpi_bd, input_bg = "#f3f6fb", "#e6ebf2", "#fbfdff"
+    else:
+        bg, panel, ink, muted, border = "#0b0f14", "#0f1521", "#e7edf7", "#9fb0c4", "#1e2b3c"
+        primary, accent = "#60a5fa", "#a78bfa"
+        card_grad = "linear-gradient(180deg, rgba(21,30,48,.94), rgba(12,17,28,.92))"
+        hero_grad = ("radial-gradient(1200px 400px at 0% -10%, rgba(96,165,250,.15), transparent 60%),"
+                     "radial-gradient(1200px 400px at 100% 110%, rgba(167,139,250,.12), transparent 60%),"
+                     "linear-gradient(180deg, rgba(18,26,40,.92), rgba(10,15,25,.92))")
+        kpi_bg, kpi_bd, input_bg = "#0f172a", "#1e293b", "#0d1422"
 
-# Minimal CSS polish
+    density_pad = ".5rem .7rem" if compact else ".62rem .8rem"
+
+    st.markdown(f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+    :root {{
+      --bg:{bg}; --panel:{panel}; --muted:{muted}; --ink:{ink};
+      --border:{border}; --primary:{primary}; --accent:{accent};
+      --kpi-bg:{kpi_bg}; --kpi-bd:{kpi_bd}; --input-bg:{input_bg};
+    }}
+    html, body, .stApp {{ background: var(--bg) !important; }}
+    h1, h2, h3, .hero-title {{
+      letter-spacing: -0.02em !important;
+      font-variant-ligatures: normal !important;
+      font-feature-settings: "liga" 1, "calt" 1 !important;
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif !important;
+      color: var(--ink);
+    }}
+    body, .stMarkdown, p, label, input, select, textarea {{
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif !important;
+      color: var(--ink);
+    }}
+    .hero {{ border-radius: 18px; padding: 26px 24px 20px; background: {hero_grad};
+             border: 1px solid var(--border); box-shadow: 0 18px 40px rgba(0,0,0,.07); margin-bottom: 12px; }}
+    .hero-title {{ font-size: clamp(28px, 4vw, 40px); line-height: 1.1; font-weight: 800; margin: 0; }}
+    .hero-sub {{ margin-top: 6px; color: var(--muted); font-size: 14px; }}
+    .card {{ background: {card_grad}; border:1px solid var(--border); padding:16px; border-radius:14px; box-shadow:0 12px 40px rgba(0,0,0,.06) }}
+    .kpi {{ display:grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap:.6rem }}
+    .kpi .box {{ background:var(--kpi-bg); border:1px solid var(--kpi-bd); border-radius:12px; padding:.9rem 1rem; height:100% }}
+    .kpi h3 {{ margin:0; font-size:1.05rem }}
+    .kpi p  {{ margin:0; font-size:.8rem; color:var(--muted) }}
+    label {{ font-size:.8rem; color:var(--muted); margin-bottom:4px; display:block }}
+    input, select, textarea {{ width:100%; padding:{density_pad}; border-radius:10px; border:1px solid var(--border);
+                               background:var(--input-bg); color:var(--ink) }}
+    .stButton>button {{ width:100%; background:linear-gradient(135deg, var(--primary), var(--accent));
+                        color:white; border:none; font-weight:700; padding:.6rem .9rem; border-radius:10px }}
+    .danger {{ background:#fee2e2; color:#991b1b; border:1px solid #fecaca; padding:.5rem .7rem; border-radius:10px }}
+    .warn   {{ background:#fff7ed; color:#9a3412; border:1px solid #fed7aa; padding:.5rem .7rem; border-radius:10px }}
+    hr.soft {{ border:0; border-top:1px solid var(--border); margin:.8rem 0 }}
+    header {{ border-bottom: none !important; }}
+    </style>
+    """, unsafe_allow_html=True)
+
+# Theme picker
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+s1, s2, s3 = st.columns([.4,.4,.2])
+with s1:
+    theme_choice = st.selectbox("Theme", ["Light","Dark"], index=["Light","Dark"].index(st.session_state["theme"]))
+with s2:
+    compact_choice = st.checkbox("Compact mode", value=st.session_state["compact"])
+with s3:
+    st.markdown("&nbsp;")
+    if st.button("Apply style"):
+        st.session_state["theme"] = theme_choice
+        st.session_state["compact"] = compact_choice
+        st.rerun()
+st.markdown("</div>", unsafe_allow_html=True)
+
+render_css(st.session_state["theme"], st.session_state["compact"])
+
+# =================== CONSTANTS ===================
+UN_COMTRADE = "https://comtradeplus.un.org/api/get"
+FX_URL = "https://api.exchangerate.host/latest"
+OPEN_SKY_STATES = "https://opensky-network.org/api/states/all"
+OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
+ORS_DIRECTIONS = "https://api.openrouteservice.org/v2/directions/driving-car"
+DEFAULT_HS = "300431"
+
+REPORTERS = {
+    "Sri Lanka (144)": "144",
+    "India (356)": "356",
+    "Denmark (208)": "208",
+    "United Arab Emirates (784)": "784",
+    "Singapore (702)": "702",
+    "World (000)": "0",
+}
+
+PRESETS = {
+    "Insulin pens (retail) — HS 300431": {
+        "hs": "300431", "incoterm": "CIF", "fob": 20000.0, "freight": 2500.0, "insurance_pct": 1.0,
+        "ins_base": "FOB", "duty_pct": 0.0, "vat_pct": 8.0, "broker": 300.0, "dray": 120.0,
+        "note": "ISFTA concession likely for India→Sri Lanka pharma (verify on MACMAP)."
+    },
+    "Pharma APIs (bulk) — HS 293721 (example)": {
+        "hs": "293721", "incoterm": "FOB", "fob": 35000.0, "freight": 1800.0, "insurance_pct": 0.6,
+        "ins_base": "FOB", "duty_pct": 2.0, "vat_pct": 8.0, "broker": 350.0, "dray": 150.0,
+        "note": "APIs may have different tariff lines/NTMs; confirm exact subheading on MACMAP."
+    },
+    "Medical devices (misc.) — HS 901890 (example)": {
+        "hs": "901890", "incoterm": "CIF", "fob": 25000.0, "freight": 3200.0, "insurance_pct": 1.0,
+        "ins_base": "CIF", "duty_pct": 5.0, "vat_pct": 8.0, "broker": 320.0, "dray": 140.0,
+        "note": "Devices can face MFN duties unless FTA/GSP applies; check serial/UDI requirements."
+    },
+}
+
+# =================== DATA HELPERS ===================
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_fx(base="USD", symbols=("LKR","EUR")):
+    try:
+        r = requests.get(FX_URL, params={"base": base, "symbols": ",".join(symbols)}, timeout=20)
+        r.raise_for_status()
+        return r.json().get("rates", {})
+    except Exception:
+        return {}
+
+@st.cache_data(show_spinner=True, ttl=3600)
+def fetch_comtrade(reporter="144", flow="1", years="2019,2020,2021,2022,2023", hs=DEFAULT_HS):
+    params = {"type":"C","freq":"A","px":"HS","ps":years,"r":reporter,"p":"all","rg":flow,"cc":hs}
+    try:
+        r = requests.get(UN_COMTRADE, params=params, timeout=60)
+        r.raise_for_status()
+        return pd.DataFrame(r.json().get("dataset", []))
+    except Exception:
+        data = [
+            {"period": 2019, "ptTitle": "India",   "TradeValue": 12000000, "NetWeight": 100000},
+            {"period": 2019, "ptTitle": "Denmark", "TradeValue":  6000000, "NetWeight":  40000},
+            {"period": 2020, "ptTitle": "India",   "TradeValue": 13000000, "NetWeight": 110000},
+            {"period": 2020, "ptTitle": "Denmark", "TradeValue":  5000000, "NetWeight":  38000},
+            {"period": 2021, "ptTitle": "India",   "TradeValue": 16000000, "NetWeight": 120000},
+            {"period": 2021, "ptTitle": "Denmark", "TradeValue":  7000000, "NetWeight":  46000},
+            {"period": 2022, "ptTitle": "India",   "TradeValue": 20000000, "NetWeight": 140000},
+            {"period": 2022, "ptTitle": "Denmark", "TradeValue":  9000000, "NetWeight":  52000},
+            {"period": 2023, "ptTitle": "India",   "TradeValue": 24000000, "NetWeight": 160000},
+            {"period": 2023, "ptTitle": "Denmark", "TradeValue": 11000000, "NetWeight":  60000},
+        ]
+        return pd.DataFrame(data)
+
+def pick_col(df: pd.DataFrame, names, fill=None):
+    for n in names:
+        if n in df.columns:
+            return df[n]
+    if fill is None:
+        return pd.Series(dtype=float)
+    return pd.Series([fill] * len(df))
+
+# Geocoding & geometry
+geolocator = Nominatim(user_agent="gtm_dashboard/1.2 (edu)")
+geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1, swallow_exceptions=True)
+
+@st.cache_data
+def geocode_point(q: str):
+    if not q: return None
+    loc = geocode(q)
+    if not loc: return None
+    return (loc.latitude, loc.longitude, loc.address)
+
+@st.cache_data
+def haversine_km(a, b):
+    R = 6371.0
+    lat1, lon1 = np.radians(a[0]), np.radians(a[1])
+    lat2, lon2 = np.radians(b[0]), np.radians(b[1])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    h = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
+    return 2 * R * np.arcsin(np.sqrt(h))
+
+def cagr(first, last, years_count):
+    if first <= 0 or years_count <= 0: return 0.0
+    return (last/first)**(1/years_count) - 1
+
+def safe_line(df, x, y, title):
+    if px is not None: return st.plotly_chart(px.line(df, x=x, y=y, markers=True, title=title), use_container_width=True)
+    st.subheader(title); st.line_chart(df.set_index(x)[y])
+
+def safe_bar(df, x, y, title, horizontal=False):
+    if px is not None: return st.plotly_chart(px.bar(df, x=x, y=y, title=title, orientation="h" if horizontal else "v"), use_container_width=True)
+    st.subheader(title); st.bar_chart(df.set_index(y if horizontal else x)[x if horizontal else y])
+
+# ============== LIVE: OpenSky (no key) ==============
+@st.cache_data(ttl=60)
+def fetch_opensky_bbox(lat, lon, box_km=15):
+    """Get live aircraft in a small lat/lon box around a point."""
+    if lat is None or lon is None: return pd.DataFrame(columns=["callsign","origin_country","alt_m","vel_ms"])
+    # ~1 deg lat ≈ 111 km ; ~1 deg lon ≈ 111 km * cos(lat)
+    dlat = box_km / 111.0
+    dlon = box_km / (111.0 * max(0.1, math.cos(math.radians(lat))))
+    params = {"lamin": lat - dlat, "lomin": lon - dlon, "lamax": lat + dlat, "lomax": lon + dlon}
+    try:
+        r = requests.get(OPEN_SKY_STATES, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json().get("states") or []
+        # states fields: [icao24, callsign, origin_country, time_position, last_contact,
+        #  longitude, latitude, baro_altitude, on_ground, velocity, heading, vertical_rate, ...]
+        rows=[]
+        for s in data:
+            rows.append({
+                "callsign": (s[1] or "").strip(),
+                "origin_country": s[2],
+                "lat": s[6], "lon": s[5],
+                "alt_m": s[7] if len(s) > 7 else None,
+                "vel_ms": s[9] if len(s) > 9 else None
+            })
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame(columns=["callsign","origin_country","alt_m","vel_ms"])
+
+# ============== LIVE: Open-Meteo weather (no key) ==============
+@st.cache_data(ttl=600)
+def fetch_weather(lat, lon):
+    if lat is None or lon is None: return {}
+    params = {"latitude": lat, "longitude": lon, "current": "temperature_2m,precipitation,wind_speed_10m"}
+    try:
+        r = requests.get(OPEN_METEO, params=params, timeout=12)
+        r.raise_for_status()
+        return r.json().get("current", {})
+    except Exception:
+        return {}
+
+def weather_risk(current):
+    if not current: return "OK", "No data"
+    wind = current.get("wind_speed_10m", 0) or 0
+    precip = current.get("precipitation", 0) or 0
+    if wind >= 12 or precip >= 5:   # ~22+ knots or heavy rain
+        return "High", f"Wind {wind} m/s, precip {precip} mm"
+    if wind >= 8 or precip >= 2:
+        return "Moderate", f"Wind {wind} m/s, precip {precip} mm"
+    return "OK", f"Wind {wind} m/s, precip {precip} mm"
+
+# ============== LIVE: OpenRouteService road ETA (optional) ==============
+def ors_eta(origin, dest):
+    """Return driving ETA (seconds) and folium PolyLine if ORS_API_KEY exists; else None."""
+    api_key = st.secrets.get("ORS_API_KEY") if hasattr(st, "secrets") else os.getenv("ORS_API_KEY")
+    if not api_key: return None, None
+    try:
+        body = {"coordinates": [[origin[1], origin[0]], [dest[1], dest[0]]]}
+        headers = {"Authorization": api_key, "Content-Type": "application/json"}
+        r = requests.post(ORS_DIRECTIONS, headers=headers, json=body, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        secs = data["features"][0]["properties"]["summary"]["duration"]
+        coords = data["features"][0]["geometry"]["coordinates"]
+        line = [(latlon[1], latlon[0]) for latlon in coords]
+        return secs, line
+    except Exception:
+        return None, None
+
+# =================== HERO ===================
 st.markdown("""
-<style>
-.small { font-size:0.85rem; color:#666; }
-.hr { border-top: 1px solid #eee; margin: 0.5rem 0 1rem 0; }
-.metric-good { color:#0a8; font-weight:600; }
-.metric-bad { color:#c33; font-weight:600; }
-blockquote { border-left: 0.25rem solid #eee; padding: 0.25rem 0 0.25rem 0.75rem; color:#555; }
-</style>
+<div class="hero">
+  <div class="hero-title">GTM Global Trade & Logistics Dashboard — Sri Lanka Focus</div>
+  <div class="hero-sub">Live trade • FX • Landed cost • Routes (map) • Emissions • Packing • Presets • Live flights/road & weather</div>
+</div>
 """, unsafe_allow_html=True)
 
-# ---------------------------
-# DEFAULT UNIVERSES
-# ---------------------------
-UNIVERSES = {
-    "US (Developed)": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "JPM", "XOM"],
-    "UK (Developed)": ["HSBA.L", "AZN.L", "BP.L", "ULVR.L", "GSK.L", "RIO.L"],
-    "India (Emerging)": ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS"],
-    "Brazil (Emerging)": ["VALE3.SA", "PETR4.SA", "ITUB4.SA", "B3SA3.SA"],
-    "South Africa (Emerging)": ["NPN.JO", "AGL.JO", "BHG.JO", "SOL.JO"],
-    "Crypto (Global)": ["BTC-USD", "ETH-USD"]
-}
+# =================== TOP CONTROLS ===================
+fx_live = fetch_fx(); fx_rate_live = float(fx_live.get("LKR", 0) or 0)
 
-INTERVALS = ["1d", "1wk", "1mo"]
-PERIODS = ["1y", "2y", "5y", "10y", "max"]
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+r1c1, r1c2, r1c3, r1c4 = st.columns([1.5, 1, 1, .9])
+with r1c1:
+    st.markdown("<label>HS code (6-digit)</label>", unsafe_allow_html=True)
+    hs_val = st.text_input("hs6", value=st.session_state["d_hs"], key="w_hs", label_visibility="collapsed")
+with r1c2:
+    st.markdown("<label>Reporter</label>", unsafe_allow_html=True)
+    REPORTERS = {"Sri Lanka (144)":"144","India (356)":"356","Denmark (208)":"208","United Arab Emirates (784)":"784","Singapore (702)":"702","World (000)":"0"}
+    reporter_name = st.selectbox("reporter", list(REPORTERS.keys()), index=0, key="w_reporter", label_visibility="collapsed")
+    reporter = REPORTERS[reporter_name]
+with r1c3:
+    st.markdown("<label>Flow</label>", unsafe_allow_html=True)
+    flow = st.selectbox("flow", ["Imports","Exports"], index=0, key="w_flow", label_visibility="collapsed")
+    flow_code = "1" if flow == "Imports" else "2"
+with r1c4:
+    st.markdown("<label>Years</label>", unsafe_allow_html=True)
+    years = st.selectbox("years", ["2019,2020,2021,2022,2023","2020,2021,2022,2023,2024","2018,2019,2020,2021,2022"],
+                         index=0, key="w_years", label_visibility="collapsed")
 
-# ---------------------------
-# UTILS
-# ---------------------------
-def compute_indicators(df):
-    """
-    Input: long-form DataFrame with columns: ['Symbol', 'Date', 'Open','High','Low','Close','Adj Close','Volume']
-    Returns df with added columns: 'Return','LogRet','SMA_20','SMA_50','EMA_12','EMA_26','MACD','MACD_Signal','RSI_14',
-    'BB_M','BB_U','BB_L','Volatility_20'
-    """
-    def rsi(series, period=14):
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.rolling(period).mean()
-        avg_loss = loss.rolling(period).mean().replace(0, np.nan)
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
+r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns([1,1,1,.8,.9])
+with r2c1:
+    st.markdown("<label>USD→LKR override (optional)</label>", unsafe_allow_html=True)
+    fx_override = st.number_input("fx", min_value=0.0, step=0.01, value=0.0, key="w_fx", label_visibility="collapsed")
+    fx_use = fx_override if fx_override > 0 else fx_rate_live
+with r2c2:
+    st.markdown("<label>Origin (city/airport/port)</label>", unsafe_allow_html=True)
+    origin_q = st.text_input("origin", value="Bengaluru BLR", key="w_origin", label_visibility="collapsed")
+with r2c3:
+    st.markdown("<label>Destination (city/port)</label>", unsafe_allow_html=True)
+    dest_q   = st.text_input("dest", value="Colombo CMB", key="w_dest", label_visibility="collapsed")
+with r2c4:
+    st.markdown("<label>Mode</label>", unsafe_allow_html=True)
+    mode = st.selectbox("mode", ["Air","Sea","Road"], index=0, key="w_mode", label_visibility="collapsed")
+with r2c5:
+    st.markdown("<label>Preset</label>", unsafe_allow_html=True)
+    PRESETS_KEYS = list(PRESETS.keys())
+    preset_name = st.selectbox("Preset", PRESETS_KEYS, index=0, key="w_preset", label_visibility="collapsed")
+    if st.button("Apply preset"):
+        p = PRESETS[preset_name]
+        for k, v in {"d_hs":"hs","d_incoterm":"incoterm","d_fob":"fob","d_freight":"freight",
+                     "d_ins_pct":"insurance_pct","d_ins_base":"ins_base","d_duty_pct":"duty_pct",
+                     "d_vat_pct":"vat_pct","d_broker":"broker","d_dray":"dray"}.items():
+            st.session_state[k] = p[v]
+        st.session_state["d_fx_note"] = p["note"]
+        st.success("Preset applied."); st.rerun()
+st.markdown("</div>", unsafe_allow_html=True)
 
-    out = []
-    for sym, g in df.groupby("Symbol", sort=False):
-        g = g.sort_values("Date").copy()
-        pxv = g["Adj Close"].astype(float)
+# =================== TRADE DATA ===================
+df = fetch_comtrade(reporter=reporter, flow=flow_code, years=years, hs=hs_val)
+period  = pick_col(df, ["period", "yr", "Time"])
+partner = pick_col(df, ["ptTitle", "partner", "Partner"], fill="World")
+value   = pick_col(df, ["TradeValue", "PrimaryValue", "value"], fill=0)
+kg      = pick_col(df, ["NetWeight", "netWgt"], fill=0)
 
-        g["Return"] = pxv.pct_change()
-        g["LogRet"] = np.log(pxv).diff()
-
-        g["SMA_20"] = pxv.rolling(20).mean()
-        g["SMA_50"] = pxv.rolling(50).mean()
-
-        g["EMA_12"] = pxv.ewm(span=12, adjust=False).mean()
-        g["EMA_26"] = pxv.ewm(span=26, adjust=False).mean()
-
-        g["MACD"] = g["EMA_12"] - g["EMA_26"]
-        g["MACD_Signal"] = g["MACD"].ewm(span=9, adjust=False).mean()
-
-        g["BB_M"] = pxv.rolling(20).mean()
-        bb_std = pxv.rolling(20).std()
-        g["BB_U"] = g["BB_M"] + 2 * bb_std
-        g["BB_L"] = g["BB_M"] - 2 * bb_std
-
-        g["RSI_14"] = rsi(pxv, 14)
-        g["Volatility_20"] = g["Return"].rolling(20).std() * np.sqrt(252)
-
-        out.append(g)
-
-    return pd.concat(out, axis=0)
-
-def prepare_ml_frame(df, horizon=1):
-    feats = [
-        "Return", "LogRet",
-        "SMA_20", "SMA_50", "EMA_12", "EMA_26",
-        "MACD", "MACD_Signal",
-        "RSI_14",
-        "BB_M", "BB_U", "BB_L",
-        "Volatility_20",
-        "LagRet_1", "LagRet_2", "LagRet_5"
-    ]
-    frames = []
-    for sym, g in df.groupby("Symbol", sort=False):
-        g = g.sort_values("Date").copy()
-        g["LagRet_1"] = g["LogRet"].shift(1)
-        g["LagRet_2"] = g["LogRet"].shift(2)
-        g["LagRet_5"] = g["LogRet"].shift(5)
-        g["Target"] = (g["LogRet"].shift(-horizon) > 0).astype(int)
-        frames.append(g)
-    X = pd.concat(frames, axis=0)
-    X = X.dropna(subset=feats + ["Target"]).copy()
-    return X, feats
-
-def sharpe_ratio(returns, risk_free=0.0, periods_per_year=252):
-    rets = pd.Series(returns).dropna()
-    if rets.empty:
-        return np.nan
-    excess = rets - (risk_free / periods_per_year)
-    mu = excess.mean() * periods_per_year
-    sigma = excess.std(ddof=0) * np.sqrt(periods_per_year)
-    if sigma == 0 or np.isnan(sigma):
-        return np.nan
-    return mu / sigma
-
-def max_drawdown(cum_curve):
-    s = pd.Series(cum_curve).replace([np.inf, -np.inf], np.nan).ffill()
-    roll_max = s.cummax()
-    dd = s / roll_max - 1.0
-    return float(dd.min()) if len(dd) else np.nan
-
-# ---------------------------
-# DATA FETCH
-# ---------------------------
-@st.cache_data(show_spinner=True)
-def fetch_prices(symbols, period="5y", interval="1d"):
-    """
-    Return a tidy (long) DataFrame with columns:
-    ['Symbol','Date','Open','High','Low','Close','Adj Close','Volume']
-    """
-    if isinstance(symbols, str):
-        symbols = [symbols]
-
-    data = yf.download(
-        tickers=" ".join(symbols),
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        threads=True,
-        group_by="ticker"
-    )
-
-    if data is None or len(data) == 0:
-        return pd.DataFrame(columns=["Symbol","Date","Open","High","Low","Close","Adj Close","Volume"])
-
-    frames = []
-    # multi-ticker (MultiIndex columns) vs single-ticker
-    if isinstance(data.columns, pd.MultiIndex):
-        top_syms = data.columns.get_level_values(0).unique().astype(str)
-        for sym in symbols:
-            if sym not in list(top_syms):
-                continue
-            g = data[sym].copy()
-            g = g.reset_index()
-            if "Date" not in g.columns:
-                # older yfinance names the datetime index column differently on reset
-                g.rename(columns={"index": "Date"}, inplace=True)
-            g.insert(0, "Symbol", sym)
-            frames.append(g)
-    else:
-        g = data.reset_index()
-        if "Date" not in g.columns:
-            g.rename(columns={"index": "Date"}, inplace=True)
-        g.insert(0, "Symbol", symbols[0])
-        frames.append(g)
-
-    if not frames:
-        return pd.DataFrame(columns=["Symbol","Date","Open","High","Low","Close","Adj Close","Volume"])
-
-    df = pd.concat(frames, axis=0, ignore_index=True)
-
-    # Normalize column names
-    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-
-    # Ensure expected columns exist
-    for col in ["Open","High","Low","Close","Adj Close","Volume"]:
-        if col not in df.columns:
-            df[col] = np.nan
-
-    # Coerce types
-    num_cols = ["Open","High","Low","Close","Adj Close","Volume"]
-    for c in num_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # Ensure datetime
-    if "Date" in df.columns and not np.issubdtype(df["Date"].dtype, np.datetime64):
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-
-    # De-duplicate on (Symbol, Date)
-    df = df.dropna(subset=["Date"]).sort_values(["Symbol","Date"])
-    df = df[~df[["Date","Symbol"]].duplicated(keep="last")]
-
-    return df
-
-# ---------------------------
-# SIDEBAR — controls
-# ---------------------------
-st.sidebar.title("Controls")
-
-market = st.sidebar.selectbox("Market", list(UNIVERSES.keys()), index=0)
-symbols_default = UNIVERSES[market]
-symbols = st.sidebar.multiselect("Symbols", options=symbols_default, default=symbols_default)
-
-period = st.sidebar.selectbox("History Window", PERIODS, index=2)  # default 5y
-interval = st.sidebar.selectbox("Sampling Interval", INTERVALS, index=0)
-
-eda_symbol = st.sidebar.selectbox(
-    "Primary symbol for deep EDA", options=symbols if symbols else symbols_default, index=0
-)
-
-# ML params
-st.sidebar.markdown("---")
-st.sidebar.subheader("ML Settings")
-horizon = st.sidebar.slider("Prediction horizon (days ahead)", 1, 5, 1, 1)
-test_size_years = st.sidebar.slider("Test span (years)", 1, 5, 2, 1)
-n_splits = st.sidebar.slider("CV splits (rolling)", 2, 5, 3, 1)
-
-# Model hyperparams (kept modest for speed)
-rf_trees = st.sidebar.slider("RF: n_estimators", 50, 400, 200, 50)
-svm_c = st.sidebar.selectbox("SVM: C", [0.1, 0.5, 1.0, 2.0, 5.0], index=2)
-mlp_hidden = st.sidebar.selectbox("ANN (MLP): hidden units", [32, 64, 128], index=1)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("IBR Objectives: EDA first • Compare RF, SVM, ANN • Sharpe/Drawdown & basic explainability")
-
-# ---------------------------
-# HEADER
-# ---------------------------
-st.title("IBR Finance — Exploratory Analysis & ML Model Comparison")
-st.markdown(
-    "A research-grade dashboard aligned to your objectives: EDA → feature building → **RF vs SVM vs ANN** next-day direction, "
-    "with backtests and risk-adjusted metrics. No uploads required — data fetched automatically from Yahoo Finance."
-)
-
-# ---------------------------
-# LOAD DATA
-# ---------------------------
-if not symbols:
-    st.warning("Please pick at least one symbol.")
-    st.stop()
-
-with st.spinner("Fetching market data..."):
-    raw = fetch_prices(symbols, period=period, interval=interval)
-
-if raw.empty:
-    st.error("No data was returned for the selected inputs. Try a different market/period/interval.")
-    st.stop()
-
-raw = raw.sort_values(["Symbol","Date"]).reset_index(drop=True)
-
-# ---------------------------
-# EDA SECTION
-# ---------------------------
-st.markdown("## 1) Exploratory Data Analysis (EDA)")
-
-# High-level coverage
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    st.metric("Symbols", f"{raw['Symbol'].nunique()}")
-with c2:
-    st.metric("Obs", f"{len(raw):,}")
-with c3:
-    st.metric("Date Range", f"{raw['Date'].min().date()} → {raw['Date'].max().date()}")
-with c4:
-    st.metric("Interval", interval)
-
-st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-
-# Picked symbol deep dive
-sym_df = raw[raw["Symbol"] == eda_symbol].copy()
-sym_df = sym_df.dropna(subset=["Adj Close"])
-sym_df["Return"] = sym_df["Adj Close"].pct_change()
-sym_df["LogRet"] = np.log(sym_df["Adj Close"]).diff()
-
-# Price chart
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["Adj Close"], mode="lines", name=f"{eda_symbol} Adj Close"))
-fig.update_layout(height=360, title=f"Price — {eda_symbol}", xaxis_title=None, yaxis_title="Adj Close")
-st.plotly_chart(fig, use_container_width=True)
-
-# Missingness & summary
-colA, colB = st.columns([2, 1])
-with colA:
-    miss = sym_df[["Open","High","Low","Close","Adj Close","Volume"]].isna().mean().sort_values(ascending=False)
-    miss_fig = px.bar(miss, title="Missingness by column (ratio)", labels={"value":"missing ratio","index":"column"})
-    miss_fig.update_layout(height=300)
-    st.plotly_chart(miss_fig, use_container_width=True)
-with colB:
-    desc = sym_df[["Adj Close","Return","LogRet","Volume"]].describe().T
-    st.dataframe(desc, use_container_width=True)
-
-# Rolling stats & distribution
-col1, col2 = st.columns(2)
-with col1:
-    roll = sym_df.set_index("Date")["Return"].rolling(20).std() * np.sqrt(252)
-    rfig = go.Figure()
-    rfig.add_trace(go.Scatter(x=roll.index, y=roll.values, mode="lines", name="Ann. Vol (20d)"))
-    rfig.update_layout(height=300, title="Rolling Annualized Volatility (20d)")
-    st.plotly_chart(rfig, use_container_width=True)
-with col2:
-    hist = px.histogram(sym_df, x="Return", nbins=60, title="Return Distribution")
-    hist.update_layout(height=300)
-    st.plotly_chart(hist, use_container_width=True)
-
-# Correlations (with technicals)
-with st.spinner("Computing technical indicators..."):
-    enriched = compute_indicators(raw)
-
-corr_cols = ["Return","LogRet","SMA_20","SMA_50","EMA_12","EMA_26","MACD","MACD_Signal","RSI_14","Volatility_20"]
-corr_df = enriched[enriched["Symbol"] == eda_symbol][corr_cols].dropna()
-if len(corr_df) > 3:
-    corr = corr_df.corr(numeric_only=True)
-    cfig = px.imshow(corr, text_auto=True, aspect="auto", title=f"Correlation Heatmap — {eda_symbol}")
-    cfig.update_layout(height=500)
-    st.plotly_chart(cfig, use_container_width=True)
+if df.empty:
+    ndf = pd.DataFrame(columns=["year","partner","value_usd","kg"])
 else:
-    st.info("Not enough data for correlation heatmap yet (wait for indicators to warm up).")
+    ndf = pd.DataFrame({
+        "year": pd.to_numeric(period, errors="coerce"),
+        "partner": partner.astype(str),
+        "value_usd": pd.to_numeric(value, errors="coerce"),
+        "kg": pd.to_numeric(kg, errors="coerce"),
+    }).dropna(subset=["year","value_usd"]).fillna(0)
 
-# Multi-symbol snapshot (last value table)
-latest = (
-    enriched.sort_values("Date")
-    .groupby("Symbol", as_index=False)
-    .apply(lambda g: g.iloc[-1][["Symbol","Date","Adj Close","RSI_14","Volatility_20"]])
-    .reset_index(drop=True)
-)
-st.markdown("#### Latest snapshot")
-st.dataframe(
-    latest.style.format({"Adj Close":"{:,.2f}", "RSI_14":"{:,.1f}", "Volatility_20":"{:,.2f}"}),
-    use_container_width=True
-)
+trend = ndf.groupby("year")["value_usd"].sum().reset_index() if not ndf.empty else pd.DataFrame(columns=["year","value_usd"])
+partners_df = (ndf.groupby("partner")["value_usd"].sum()
+               .reset_index().sort_values("value_usd", ascending=False)) if not ndf.empty else pd.DataFrame(columns=["partner","value_usd"])
+unit_vals = (ndf.groupby("year").apply(lambda g: (g["value_usd"].sum() / max(1.0, g["kg"].sum())))
+             .reset_index(name="usd_per_kg")) if not ndf.empty else pd.DataFrame(columns=["year","usd_per_kg"])
 
-st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+total_trade = float(trend["value_usd"].sum()) if not trend.empty else 0.0
+_top = partners_df.iloc[0] if not partners_df.empty else pd.Series({"partner":"—","value_usd":0})
+years_sorted = sorted(trend["year"].tolist()) if not trend.empty else []
+yoy = 0.0; cagr_val = 0.0
+if len(years_sorted) >= 2:
+    first = float(trend.loc[trend["year"]==years_sorted[0], "value_usd"].values[0])
+    last  = float(trend.loc[trend["year"]==years_sorted[-1], "value_usd"].values[0])
+    diffs = []
+    for i in range(1, len(years_sorted)):
+        prev = float(trend.loc[trend["year"]==years_sorted[i-1], "value_usd"].values[0])
+        cur  = float(trend.loc[trend["year"]==years_sorted[i],   "value_usd"].values[0])
+        diffs.append((cur - prev) / max(1.0, prev))
+    yoy = float(np.mean(diffs)) if diffs else 0.0
+    cagr_val = (last/first)**(1/(len(years_sorted)-1)) - 1 if first>0 else 0.0
 
-# ---------------------------
-# ML SECTION
-# ---------------------------
-st.markdown("## 2) Model Comparison — RF vs SVM vs ANN (MLP)")
+# =================== ROUTE, LIVE SIGNALS ===================
+o_pt = geocode_point(origin_q); d_pt = geocode_point(dest_q)
+dist_km = None; lead_time_days = 0.0
+if o_pt and d_pt:
+    a, b = (o_pt[0], o_pt[1]), (d_pt[0], d_pt[1])
+    dist_km = float(haversine_km(a, b))
+    speed = 800 if mode == "Air" else (35*24 if mode == "Sea" else 60)  # km/h; sea uses ship/day proxy
+    handling = 0.8 if mode == "Air" else (1.5 if mode == "Sea" else 0.2)
+    clearance = 0.8 if mode == "Air" else (2.0 if mode == "Sea" else 0.5)
+    local = 0.3 if mode == "Air" else (0.5 if mode == "Sea" else 0.2)
+    lead_time_days = (dist_km / speed) / 24 + handling + clearance + local
 
-ml_df, features = prepare_ml_frame(enriched, horizon=horizon)
-if ml_df.empty:
-    st.error("Insufficient data after feature engineering. Try increasing period or using daily interval.")
-    st.stop()
+# Emission factors (g CO2e per tonne-km)
+EF = {"Air": 600.0, "Sea": 15.0, "Road": 120.0}
 
-# Split train/test chronologically (last 'test_size_years' years as test)
-max_date = ml_df["Date"].max()
-cutoff = max_date - pd.DateOffset(years=test_size_years)
-train = ml_df[ml_df["Date"] < cutoff].copy()
-test = ml_df[ml_df["Date"] >= cutoff].copy()
+# =================== KPI ROW ===================
+st.markdown('<div class="kpi">', unsafe_allow_html=True)
+st.markdown(f'<div class="box"><p>Total Trade (USD)</p><h3>{total_trade:,.0f}</h3></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="box"><p>Top Partner</p><h3>{_top["partner"]} ({float(_top["value_usd"]):,.0f})</h3></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="box"><p># Partners</p><h3>{partners_df.shape[0]}</h3></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="box"><p>Avg YoY Growth</p><h3>{yoy*100:.1f}%</h3></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="box"><p>CAGR (period)</p><h3>{cagr_val*100:.1f}%</h3></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="box"><p>FX USD→LKR</p><h3>{fx_rate_live:.2f}</h3></div>', unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)
 
-if train["Target"].nunique() < 2 or test["Target"].nunique() < 2:
-    st.warning("Target class imbalance or insufficient variety in train/test. Consider a longer period.")
-    st.stop()
+# =================== CHARTS + MAP (with live) ===================
+left, right = st.columns([1.12, .88], gap="small")
 
-X_train = train[features].values
-y_train = train["Target"].values
-X_test = test[features].values
-y_test = test["Target"].values
+with left:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    tabs = st.tabs(["Trend", "Partner Share", "Unit Values", "Raw"])
+    with tabs[0]:
+        if not trend.empty: safe_line(trend, "year", "value_usd", "Total Trade (USD)")
+        else: st.info("No data for selected filters.")
+    with tabs[1]:
+        if not partners_df.empty: safe_bar(partners_df.head(12), "value_usd", "partner", "Top Partners (USD)", horizontal=True)
+        else: st.info("No partner data.")
+    with tabs[2]:
+        if not unit_vals.empty: safe_line(unit_vals, "year", "usd_per_kg", "Unit Value (USD/kg)")
+        else: st.info("No unit value data.")
+    with tabs[3]:
+        st.dataframe(ndf, use_container_width=True)
+        bbuf = io.StringIO(); ndf.to_csv(bbuf, index=False)
+        st.download_button("Download raw dataset (CSV)", data=bbuf.getvalue(), file_name="trade_raw.csv", mime="text/csv")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-# Pipelines (scale where needed)
-pipelines = {
-    "RandomForest": Pipeline([
-        ("rf", RandomForestClassifier(
-            n_estimators=rf_trees,
-            max_depth=None,
-            random_state=42,
-            n_jobs=-1
-        ))
-    ]),
-    "SVM (RBF)": Pipeline([
-        ("sc", StandardScaler(with_mean=True, with_std=True)),
-        ("svm", SVC(C=svm_c, kernel="rbf", gamma="scale", probability=True, random_state=42))
-    ]),
-    "ANN (MLP)": Pipeline([
-        ("sc", StandardScaler(with_mean=True, with_std=True)),
-        ("mlp", MLPClassifier(hidden_layer_sizes=(mlp_hidden,),
-                              activation="relu",
-                              solver="adam",
-                              alpha=1e-4,
-                              learning_rate_init=1e-3,
-                              max_iter=300,
-                              random_state=42))
-    ])
+with right:
+    st.markdown("<div class='card'><b>Route • Live Flights • Live Weather</b>", unsafe_allow_html=True)
+    w1, w2 = st.columns(2)
+    with w1:
+        ship_kg = st.number_input("Shipment weight (kg)", min_value=0.0, value=200.0, step=10.0, key="w_shipkg")
+    with w2:
+        temp_ctrl = st.checkbox("Temperature-controlled (cold chain)", value=True, key="w_cold")
+
+    if o_pt and d_pt:
+        fmap = folium.Map(location=[(o_pt[0]+d_pt[0])/2, (o_pt[1]+d_pt[1])/2], zoom_start=4, control_scale=True)
+        folium.Marker((o_pt[0], o_pt[1]), tooltip=f"Origin: {origin_q}").add_to(fmap)
+        folium.Marker((d_pt[0], d_pt[1]), tooltip=f"Destination: {dest_q}").add_to(fmap)
+
+        # Optional: road ETA polyline via ORS
+        eta_secs, ors_line = (None, None)
+        if mode == "Road":
+            eta_secs, ors_line = ors_eta((o_pt[0], o_pt[1]), (d_pt[0], d_pt[1]))
+            if ors_line:
+                folium.PolyLine(ors_line, color="#2563eb", weight=4, tooltip="OpenRouteService route").add_to(fmap)
+        if not ors_line:
+            folium.PolyLine([(o_pt[0], o_pt[1]), (d_pt[0], d_pt[1])], color="#2563eb", weight=4).add_to(fmap)
+
+        st_folium(fmap, height=430, use_container_width=True)
+
+        # Live weather + risk
+        ow = fetch_weather(o_pt[0], o_pt[1]); dw = fetch_weather(d_pt[0], d_pt[1])
+        orisk, omsg = weather_risk(ow); drisk, dmsg = weather_risk(dw)
+        st.write(f"🛰️ Lead time est.: **{lead_time_days:.1f} days** ({mode}) | Distance ≈ **{(dist_km or 0):,.0f} km**")
+        if mode == "Road" and eta_secs:
+            st.write(f"🚚 Live road ETA (OpenRouteService): **{eta_secs/3600:.1f} h**")
+        st.write(f"🌤️ Origin weather risk: **{orisk}** ({omsg})  •  Destination: **{drisk}** ({dmsg})")
+
+        # Live flights near origin/destination (OpenSky)
+        with st.expander("Live flights near origin & destination (OpenSky)"):
+            o_df = fetch_opensky_bbox(o_pt[0], o_pt[1], box_km=25)
+            d_df = fetch_opensky_bbox(d_pt[0], d_pt[1], box_km=25)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.caption(f"Origin vicinity ({origin_q}) — aircraft in air: {len(o_df)}")
+                if not o_df.empty: st.dataframe(o_df[["callsign","origin_country","alt_m","vel_ms"]], use_container_width=True, height=220)
+                else: st.info("No live aircraft detected in this box right now.")
+            with c2:
+                st.caption(f"Destination vicinity ({dest_q}) — aircraft in air: {len(d_df)}")
+                if not d_df.empty: st.dataframe(d_df[["callsign","origin_country","alt_m","vel_ms"]], use_container_width=True, height=220)
+                else: st.info("No live aircraft detected in this box right now.")
+
+        # Emissions calc
+        tonnes = (st.session_state.get("w_shipkg",0) or 0) / 1000.0
+        ef = EF.get(mode, 120.0)
+        co2e_kg = (dist_km or 0) * tonnes * (ef / 1000.0)
+        st.metric("Estimated emissions (kg CO₂e)", f"{co2e_kg:,.0f}")
+        if temp_ctrl and lead_time_days and lead_time_days > 3 and mode != "Air":
+            st.markdown("<div class='warn'>⚠️ Cold chain risk: long lead time. Consider passive packaging upgrades or Air.</div>", unsafe_allow_html=True)
+    else:
+        st.info("Enter clear locations (e.g., 'Bengaluru BLR', 'Colombo CMB').")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+
+# =================== COSTS & SENSITIVITY ===================
+st.markdown("<div class='card'><b>Landed Cost • Sensitivity</b>", unsafe_allow_html=True)
+lc1, lc2, lc3, lc4 = st.columns([1,1,1,.9])
+with lc1:
+    incoterm = st.selectbox("Incoterm", ["FOB","CIF","DAP","DDP"],
+                            index=["FOB","CIF","DAP","DDP"].index(st.session_state["d_incoterm"]), key="w_inc")
+    fob = st.number_input("FOB value (USD)", min_value=0.0, value=st.session_state["d_fob"], step=100.0, key="w_fob")
+    insurance_pct = st.number_input("Insurance %", min_value=0.0, value=st.session_state["d_ins_pct"], step=0.1, key="w_ins_pct")
+with lc2:
+    ins_base = st.selectbox("Insurance base", ["FOB","CIF"],
+                            index=["FOB","CIF"].index(st.session_state["d_ins_base"]), key="w_ins_base")
+    freight = st.number_input("Freight (USD)", min_value=0.0, value=st.session_state["d_freight"], step=50.0, key="w_freight")
+    broker = st.number_input("Brokerage & Handling (USD)", min_value=0.0, value=st.session_state["d_broker"], step=10.0, key="w_broker")
+with lc3:
+    dray = st.number_input("Last-mile / Drayage (USD)", min_value=0.0, value=st.session_state["d_dray"], step=10.0, key="w_dray")
+    duty_pct = st.number_input("Duty %", min_value=0.0, value=st.session_state["d_duty_pct"], step=0.5, key="w_duty")
+    vat_pct = st.number_input("VAT / GST %", min_value=0.0, value=st.session_state["d_vat_pct"], step=0.5, key="w_vat")
+with lc4:
+    fx_sens = st.slider("FX shock (USD→LKR) %", -20, 20, 0, key="w_fx_shock")
+    shock_freight = st.slider("Freight shock %", 0, 200, 0, key="w_shock_f")
+    shock_tariff  = st.slider("Tariff shock (Δ duty %)", 0, 20, 0, key="w_shock_t")
+
+def landed_cost(fob, freight, insurance_pct, ins_base, duty_pct, vat_pct, broker, dray, shock_freight, incoterm):
+    freight_final = freight * (1 + shock_freight/100)
+    ins_base_val = fob if ins_base == "FOB" else (fob + freight_final)
+    insurance = ins_base_val * (insurance_pct/100)
+    cif = fob + freight_final + insurance
+    duty = cif * (duty_pct/100)
+    taxable = cif + duty
+    vat = taxable * (vat_pct/100)
+    total = taxable + vat + broker + dray
+    if incoterm == "FOB":
+        total = fob + freight_final + insurance + duty + vat + broker + dray
+    return {"freight_final":freight_final, "insurance":insurance, "cif":cif, "duty":duty, "vat":vat, "total":total}
+
+res = landed_cost(fob, freight, insurance_pct, ins_base, duty_pct+shock_tariff, vat_pct, broker, dray, shock_freight, incoterm)
+
+m1, m2, m3, m4, m5, m6 = st.columns(6)
+with m1: st.metric("Freight (after shock)", f"${res['freight_final']:,.0f}")
+with m2: st.metric("Insurance", f"${res['insurance']:,.0f}")
+with m3: st.metric("CIF", f"${res['cif']:,.0f}")
+with m4: st.metric("Duty", f"${res['duty']:,.0f}")
+with m5: st.metric("VAT", f"${res['vat']:,.0f}")
+with m6:
+    st.metric("Total Landed Cost", f"${res['total']:,.0f}")
+    if lead_time_days: st.caption(f"Lead time est. {lead_time_days:.1f} days ({mode}).")
+st.markdown("</div>", unsafe_allow_html=True)
+
+# =================== ORIGIN COMPARISON ===================
+st.markdown("<div class='card'><b>Compare Origins (What-if)</b>", unsafe_allow_html=True)
+comp_df = pd.DataFrame([
+    {"Origin":"India",    "FOB": fob,          "Freight": 2500, "Duty%": 0.0},
+    {"Origin":"Denmark",  "FOB": fob*1.05,     "Freight": 5500, "Duty%": max(duty_pct, 2.0)},
+    {"Origin":"Singapore","FOB": fob*1.02,     "Freight": 3200, "Duty%": duty_pct},
+])
+rows=[]
+for _, r in comp_df.iterrows():
+    rr = landed_cost(r.FOB, r.Freight, insurance_pct, ins_base, r["Duty%"], vat_pct, broker, dray, shock_freight, incoterm)
+    rows.append({"Origin":r.Origin, "TLC_USD":rr["total"], "CIF":rr["cif"], "Duty":rr["duty"], "VAT":rr["vat"]})
+out = pd.DataFrame(rows)
+st.dataframe(out, use_container_width=True)
+if px is not None: st.plotly_chart(px.bar(out, x="Origin", y="TLC_USD", title="Total Landed Cost by Origin (USD)"), use_container_width=True)
+else: st.bar_chart(out.set_index("Origin")["TLC_USD"])
+st.markdown("</div>", unsafe_allow_html=True)
+
+# =================== PRESETS / NOTES / PACKING ===================
+boxL, boxR = st.columns([1.05, .95], gap="small")
+
+with boxL:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    with st.expander("Incoterms quick help"):
+        st.markdown("- **FOB**: Buyer pays freight/insurance from origin port; seller handles export.")
+        st.markdown("- **CIF**: Seller covers cost+insurance+freight to destination port.")
+        st.markdown("- **DAP**: Delivered at place (unloaded not included); buyer does import clearance/taxes.")
+        st.markdown("- **DDP**: Seller covers everything including import duties/taxes.")
+    st.markdown("**Tariff & NTM helper**")
+    st.markdown("- 🧭 [MACMAP — Tariffs & Measures](https://www.macmap.org/)\n- 📊 [TradeMap — Flows](https://www.trademap.org/)\n- 🏛️ [Sri Lanka Customs](http://www.customs.gov.lk/)")
+    st.caption("Use HS-6 to start; verify MFN vs FTA (e.g., ISFTA) vs GSP+ on national lines.")
+    st.text_area("Notes", value=st.session_state.get("d_fx_note",""), key="w_notes", height=120)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with boxR:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("**Packing • ULD & Container Capacity**")
+    pc1, pc2, pc3 = st.columns(3)
+    with pc1:
+        carton_l = st.number_input("Carton length (cm)", 1.0, 200.0, 40.0, key="w_pl")
+        carton_w = st.number_input("Carton width (cm)",  1.0, 200.0, 30.0, key="w_pw")
+        carton_h = st.number_input("Carton height (cm)", 1.0, 200.0, 25.0, key="w_ph")
+    with pc2:
+        carton_kg = st.number_input("Carton weight (kg)", 0.1, 200.0, 8.0, key="w_pkg")
+        layer_gap = st.number_input("Layer gap (cm)", 0.0, 10.0, 0.0, key="w_gap")
+        max_stack_h = st.number_input("Max stack height (cm)", 50.0, 250.0, 140.0, key="w_maxh")
+    with pc3:
+        use_pmc = st.checkbox("Air PMC pallet (243×318×160 cm)", value=True, key="w_pmc")
+        use_20  = st.checkbox("Sea 20' (589×235×239 cm)", value=False, key="w_20")
+        use_40  = st.checkbox("Sea 40' (1203×235×239 cm)", value=False, key="w_40")
+    def pack_on(base_l, base_w, base_h):
+        per_row = math.floor(base_l // carton_l) * math.floor(base_w // carton_w)
+        layers  = math.floor((min(base_h, max_stack_h)) // (carton_h + layer_gap))
+        boxes   = max(0, per_row) * max(0, layers)
+        kg_total= boxes * carton_kg
+        return boxes, kg_total
+    results = []
+    if use_pmc: results.append(("PMC pallet", *pack_on(243.0, 318.0, 160.0)))
+    if use_20:  results.append(("20' container", *pack_on(589.0, 235.0, 239.0)))
+    if use_40:  results.append(("40' container", *pack_on(1203.0, 235.0, 239.0)))
+    if results:
+        pk_df = pd.DataFrame(results, columns=["Unit","Max cartons","Total kg"])
+        st.dataframe(pk_df, use_container_width=True)
+        if px is not None: st.plotly_chart(px.bar(pk_df, x="Unit", y="Max cartons", title="Packing capacity"), use_container_width=True)
+        else: st.bar_chart(pk_df.set_index("Unit")["Max cartons"])
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# =================== SAVE / COMPARE SCENARIOS ===================
+st.markdown("<div class='card'><b>Save & Compare Scenarios</b>", unsafe_allow_html=True)
+sc1, sc2 = st.columns([.4,.6])
+with sc1:
+    scenario_name = st.text_input("Scenario name", value="My scenario")
+    if st.button("Save this scenario"):
+        entry = {
+            "name": scenario_name,
+            "hs": hs_val, "reporter": reporter_name, "flow": flow, "years": years,
+            "mode": mode, "origin": origin_q, "dest": dest_q, "dist_km": dist_km,
+            "incoterm": incoterm, "fob": fob, "freight": freight, "insurance_pct": insurance_pct,
+            "ins_base": ins_base, "duty_pct": duty_pct, "vat_pct": vat_pct, "broker": broker, "dray": dray,
+            "shock_freight": shock_freight, "shock_tariff": shock_tariff,
+            "tlc_usd": res["total"],
+            "emissions_kg": ((dist_km or 0)*(st.session_state.get("w_shipkg",0)/1000.0)*(EF.get(mode,120.0)/1000.0))
+        }
+        st.session_state["scenarios"].append(entry)
+        st.success(f"Saved: {scenario_name}")
+with sc2:
+    if st.session_state["scenarios"]:
+        sdf = pd.DataFrame(st.session_state["scenarios"])
+        st.dataframe(sdf[["name","mode","origin","dest","tlc_usd","emissions_kg"]], use_container_width=True)
+        if px is not None and len(sdf) > 0:
+            st.plotly_chart(px.bar(sdf, x="name", y="tlc_usd", title="Scenario TLC (USD)"), use_container_width=True)
+            st.plotly_chart(px.bar(sdf, x="name", y="emissions_kg", title="Scenario Emissions (kg CO₂e)"), use_container_width=True)
+        b2 = io.StringIO(); sdf.to_csv(b2, index=False)
+        st.download_button("Download scenarios CSV", data=b2.getvalue(), file_name="gtm_scenarios.csv", mime="text/csv")
+    else:
+        st.info("No saved scenarios yet.")
+st.markdown("</div>", unsafe_allow_html=True)
+
+# =================== EXPORT SNAPSHOT ===================
+exp = {
+    "hs": hs_val, "reporter": reporter_name, "flow": flow, "years": years,
+    "fx_rate_usd_lkr": fx_use*(1+st.session_state["w_fx_shock"]/100) if "w_fx_shock" in st.session_state else fx_use,
+    "route": {"origin": origin_q, "dest": dest_q, "mode": mode,
+              "distance_km": (None if dist_km is None else round(dist_km,1)),
+              "lead_time_days": (None if not lead_time_days else round(lead_time_days,1))},
+    "inputs": {"incoterm": incoterm, "fob": fob, "freight": freight, "insurance_pct": insurance_pct,
+               "ins_base": ins_base, "duty_pct": duty_pct, "vat_pct": vat_pct, "broker": broker,
+               "dray": dray, "shock_freight": shock_freight, "shock_tariff": shock_tariff},
+    "outputs": res,
 }
+row = {}
+row.update(exp["inputs"])
+if not trend.empty:
+    for _, r in trend.iterrows(): row[f"trend_{int(r.year)}"] = float(r.value_usd)
+if not partners_df.empty:
+    for _, r in partners_df.head(10).iterrows(): row[f"partner_{r.partner}"] = float(r.value_usd)
+row["tlc_usd"] = res["total"]; row["cif"] = res["cif"]; row["duty"] = res["duty"]; row["vat"] = res["vat"]
+csv_buf = io.StringIO(); pd.DataFrame([row]).to_csv(csv_buf, index=False)
 
-tscv = TimeSeriesSplit(n_splits=n_splits)
+dl1, dl2 = st.columns(2)
+with dl1: st.download_button("Download scenario CSV", data=csv_buf.getvalue(), file_name="gtm_scenario.csv", mime="text/csv")
+with dl2: st.download_button("Download scenario JSON", data=json.dumps(exp, indent=2), file_name="gtm_scenario.json", mime="application/json")
 
-with st.spinner("Training and evaluating models..."):
-    rows, proba_dict, preds_dict = [], {}, {}
-
-    for name, pipe in pipelines.items():
-        # quick CV accuracy for info
-        cv_scores = []
-        for tr_idx, va_idx in tscv.split(X_train):
-            X_tr, X_va = X_train[tr_idx], X_train[va_idx]
-            y_tr, y_va = y_train[tr_idx], y_train[va_idx]
-            p = pipe.fit(X_tr, y_tr)
-            cv_scores.append(accuracy_score(y_va, p.predict(X_va)))
-
-        pipe.fit(X_train, y_train)
-        y_hat = pipe.predict(X_test)
-
-        # proba (fallbacks handled)
-        if hasattr(pipe[-1], "predict_proba"):
-            y_proba = pipe.predict_proba(X_test)[:, 1]
-        elif hasattr(pipe[-1], "decision_function"):
-            dfunc = pipe.decision_function(X_test)
-            y_proba = 1 / (1 + np.exp(-dfunc))
-        else:
-            y_proba = y_hat.astype(float)
-
-        proba_dict[name] = y_proba
-        preds_dict[name] = y_hat
-
-        # Metrics
-        acc = accuracy_score(y_test, y_hat)
-        prec = precision_score(y_test, y_hat, zero_division=0)
-        rec = recall_score(y_test, y_hat, zero_division=0)
-        f1 = f1_score(y_test, y_hat, zero_division=0)
-        try:
-            auc = roc_auc_score(y_test, y_proba)
-        except Exception:
-            auc = np.nan
-
-        rows.append({
-            "Model": name,
-            "CV Acc (mean)": float(np.mean(cv_scores)),
-            "Test Acc": acc, "Precision": prec, "Recall": rec, "F1": f1, "ROC-AUC": auc
-        })
-
-    metrics_df = pd.DataFrame(rows).sort_values("Test Acc", ascending=False)
-
-st.markdown("#### Classification metrics (Out-of-sample)")
-st.dataframe(
-    metrics_df.style.format({
-        "CV Acc (mean)":"{:.3f}",
-        "Test Acc":"{:.3f}",
-        "Precision":"{:.3f}",
-        "Recall":"{:.3f}",
-        "F1":"{:.3f}",
-        "ROC-AUC":"{:.3f}",
-    }),
-    use_container_width=True
-)
-
-# Backtest: long/flat by proba>0.5, equal-weight across symbols
-bt = test[["Date","Symbol","LogRet"]].copy().reset_index(drop=True)
-
-bt_curves, risk_rows = {}, []
-for name, proba in proba_dict.items():
-    if len(proba) != len(bt):
-        # very defensive alignment fallback
-        proba = np.resize(proba, len(bt))
-    sig = (proba > 0.5).astype(int) * 1.0
-    pos = pd.Series(sig).shift(1).fillna(0.0).values  # avoid lookahead
-
-    strat_ret = pos * bt["LogRet"].values
-    df_tmp = bt.copy()
-    df_tmp["StratRet"] = strat_ret
-    eq = df_tmp.groupby("Date", as_index=True)["StratRet"].mean()
-    cum = (1 + eq).cumprod()
-
-    bt_curves[name] = cum
-    risk_rows.append({"Model": name, "Sharpe": sharpe_ratio(eq.values), "Max Drawdown": max_drawdown(cum.values)})
-
-risk_df = pd.DataFrame(risk_rows).sort_values("Sharpe", ascending=False)
-
-colX, colY = st.columns([2,1])
-with colX:
-    fig_bt = go.Figure()
-    for name, curve in bt_curves.items():
-        fig_bt.add_trace(go.Scatter(x=curve.index, y=curve.values, mode="lines", name=name))
-    fig_bt.update_layout(height=380, title="Backtest — Equity Curves (equal-weight, long/flat based on model signal)",
-                         yaxis_title="Growth of $1")
-    st.plotly_chart(fig_bt, use_container_width=True)
-
-with colY:
-    st.markdown("#### Risk-adjusted performance")
-    st.dataframe(
-        risk_df.style.format({"Sharpe":"{:.2f}", "Max Drawdown":"{:.1%}"}),
-        use_container_width=True
-    )
-
-# Confusion matrices
-st.markdown("#### Confusion matrices (Out-of-sample)")
-cm_cols = st.columns(3)
-for (name, yhat), container in zip(list(preds_dict.items())[:3], cm_cols):
-    cm = confusion_matrix(y_test, yhat)
-    z = pd.DataFrame(cm, index=["Actual 0","Actual 1"], columns=["Pred 0","Pred 1"])
-    with container:
-        fig_cm = px.imshow(z, text_auto=True, aspect="auto", title=name)
-        fig_cm.update_layout(height=300, margin=dict(l=20,r=20,t=60,b=20))
-        st.plotly_chart(fig_cm, use_container_width=True)
-
-# Feature importance (RF only)
-rf = pipelines["RandomForest"].fit(X_train, y_train)
-try:
-    importances = rf[-1].feature_importances_
-    fi = pd.DataFrame({"Feature": features, "Importance": importances}).sort_values("Importance", ascending=False)
-    st.markdown("#### RF — Feature importance (Gini)")
-    st.dataframe(fi, use_container_width=True)
-    fi_fig = px.bar(fi.head(12), x="Importance", y="Feature", orientation="h", title="Top features (RF)")
-    fi_fig.update_layout(height=400)
-    st.plotly_chart(fi_fig, use_container_width=True)
-except Exception:
-    st.info("Feature importance not available.")
-
-st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-
-# ---------------------------
-# NOTES / ALIGNMENT
-# ---------------------------
-st.markdown("## 3) Notes & Alignment to Objectives")
-st.markdown("""
-- **EDA first**: coverage, missingness, distributions, rolling volatility, correlations, and key technicals are surfaced before modeling.  
-- **Model comparison**: like-for-like setup for **RF vs SVM vs ANN (MLP)** on next-day direction across selected markets.  
-- **Risk & Backtest**: transparent long/flat strategy from predicted direction → equity curves, **Sharpe** & **Max Drawdown**.  
-- **No uploads**: Data pulled via Yahoo Finance (`yfinance`).  
-- **Emerging vs Developed**: quick toggles for India/Brazil/South Africa vs US/UK (extend the ticker lists as needed).  
-- **Method guards**: time-series split, scaling inside pipelines, horizon shift, and strict out-of-sample evaluation.
-""")
-st.markdown("> Tip: add macro/sector features or widen ticker sets in `UNIVERSES` to expand the study.")
+st.caption("Educational tool. Verify tariffs/NTMs with official sources (MACMAP, Sri Lanka Customs).")
