@@ -3,6 +3,29 @@
 # Models: RandomForest (RF), Support Vector Machine (SVM), Artificial Neural Network (MLP)
 # Data: auto-fetched from Yahoo via yfinance (no file uploads needed)
 
+# ---------------------------
+# BOOTSTRAP MISSING PACKAGES (so the app still runs if requirements are incomplete)
+# ---------------------------
+def _ensure(pkgs):
+    import importlib, sys, subprocess
+    for name, pip_name in pkgs:
+        try:
+            importlib.import_module(name)
+        except ModuleNotFoundError:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+
+_ensure([
+    ("streamlit", "streamlit>=1.38"),
+    ("pandas", "pandas>=1.5"),
+    ("numpy", "numpy>=1.23"),
+    ("yfinance", "yfinance>=0.2.40"),
+    ("plotly", "plotly>=5.24"),
+    ("sklearn", "scikit-learn>=1.3"),
+])
+
+# ---------------------------
+# IMPORTS
+# ---------------------------
 import os
 import math
 import time
@@ -45,8 +68,7 @@ blockquote { border-left: 0.25rem solid #eee; padding: 0.25rem 0 0.25rem 0.75rem
 """, unsafe_allow_html=True)
 
 # ---------------------------
-# DEFAULT UNIVERSES (developed + emerging) — small curated sets
-# (Avoids scraping constituents; extend as desired)
+# DEFAULT UNIVERSES
 # ---------------------------
 UNIVERSES = {
     "US (Developed)": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "JPM", "XOM"],
@@ -57,18 +79,12 @@ UNIVERSES = {
     "Crypto (Global)": ["BTC-USD", "ETH-USD"]
 }
 
-# Helpful intervals from Yahoo
 INTERVALS = ["1d", "1wk", "1mo"]
 PERIODS = ["1y", "2y", "5y", "10y", "max"]
 
 # ---------------------------
 # UTILS
 # ---------------------------
-def _safe_name(x):
-    if isinstance(x, (list, tuple, np.ndarray, pd.Index)):
-        return ", ".join(map(str, x))
-    return str(x)
-
 def compute_indicators(df):
     """
     Input: long-form DataFrame with columns: ['Symbol', 'Date', 'Open','High','Low','Close','Adj Close','Volume']
@@ -80,55 +96,40 @@ def compute_indicators(df):
         gain = delta.clip(lower=0)
         loss = -delta.clip(upper=0)
         avg_gain = gain.rolling(period).mean()
-        avg_loss = loss.rolling(period).mean()
-        rs = avg_gain / (avg_loss.replace(0, np.nan))
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
+        avg_loss = loss.rolling(period).mean().replace(0, np.nan)
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
 
     out = []
     for sym, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Date").copy()
-        px = g["Adj Close"].astype(float)
+        pxv = g["Adj Close"].astype(float)
 
-        # Returns
-        g["Return"] = px.pct_change()
-        g["LogRet"] = np.log(px).diff()
+        g["Return"] = pxv.pct_change()
+        g["LogRet"] = np.log(pxv).diff()
 
-        # SMAs
-        g["SMA_20"] = px.rolling(20).mean()
-        g["SMA_50"] = px.rolling(50).mean()
+        g["SMA_20"] = pxv.rolling(20).mean()
+        g["SMA_50"] = pxv.rolling(50).mean()
 
-        # EMAs
-        g["EMA_12"] = px.ewm(span=12, adjust=False).mean()
-        g["EMA_26"] = px.ewm(span=26, adjust=False).mean()
+        g["EMA_12"] = pxv.ewm(span=12, adjust=False).mean()
+        g["EMA_26"] = pxv.ewm(span=26, adjust=False).mean()
 
-        # MACD
         g["MACD"] = g["EMA_12"] - g["EMA_26"]
         g["MACD_Signal"] = g["MACD"].ewm(span=9, adjust=False).mean()
 
-        # Bollinger Bands
-        g["BB_M"] = px.rolling(20).mean()
-        bb_std = px.rolling(20).std()
+        g["BB_M"] = pxv.rolling(20).mean()
+        bb_std = pxv.rolling(20).std()
         g["BB_U"] = g["BB_M"] + 2 * bb_std
         g["BB_L"] = g["BB_M"] - 2 * bb_std
 
-        # RSI
-        g["RSI_14"] = rsi(px, 14)
-
-        # Rolling volatility (20d)
+        g["RSI_14"] = rsi(pxv, 14)
         g["Volatility_20"] = g["Return"].rolling(20).std() * np.sqrt(252)
 
         out.append(g)
 
-    out = pd.concat(out, axis=0)
-    return out
+    return pd.concat(out, axis=0)
 
 def prepare_ml_frame(df, horizon=1):
-    """
-    Build supervised dataset for next-day direction classification.
-    Features: technicals + lagged returns
-    Target: 1 if next LogRet > 0 else 0 (per symbol)
-    """
     feats = [
         "Return", "LogRet",
         "SMA_20", "SMA_50", "EMA_12", "EMA_26",
@@ -136,7 +137,6 @@ def prepare_ml_frame(df, horizon=1):
         "RSI_14",
         "BB_M", "BB_U", "BB_L",
         "Volatility_20",
-        # Add a few lags for returns (auto-correlations)
         "LagRet_1", "LagRet_2", "LagRet_5"
     ]
     frames = []
@@ -163,10 +163,10 @@ def sharpe_ratio(returns, risk_free=0.0, periods_per_year=252):
     return mu / sigma
 
 def max_drawdown(cum_curve):
-    s = pd.Series(cum_curve).fillna(method="ffill")
+    s = pd.Series(cum_curve).replace([np.inf, -np.inf], np.nan).ffill()
     roll_max = s.cummax()
     dd = s / roll_max - 1.0
-    return dd.min()
+    return float(dd.min()) if len(dd) else np.nan
 
 # ---------------------------
 # DATA FETCH
@@ -190,20 +190,27 @@ def fetch_prices(symbols, period="5y", interval="1d"):
         group_by="ticker"
     )
 
+    if data is None or len(data) == 0:
+        return pd.DataFrame(columns=["Symbol","Date","Open","High","Low","Close","Adj Close","Volume"])
+
     frames = []
-    # When single symbol, yfinance returns columns leveled differently, handle both cases.
+    # multi-ticker (MultiIndex columns) vs single-ticker
     if isinstance(data.columns, pd.MultiIndex):
-        # multi-symbol
+        top_syms = data.columns.get_level_values(0).unique().astype(str)
         for sym in symbols:
-            if sym not in data.columns.levels[0] and sym not in data.columns.get_level_values(0).unique():
+            if sym not in list(top_syms):
                 continue
             g = data[sym].copy()
-            g = g.reset_index().rename(columns={"index":"Date"})
+            g = g.reset_index()
+            if "Date" not in g.columns:
+                # older yfinance names the datetime index column differently on reset
+                g.rename(columns={"index": "Date"}, inplace=True)
             g.insert(0, "Symbol", sym)
             frames.append(g)
     else:
-        # single symbol case
-        g = data.reset_index().rename(columns={"index":"Date"})
+        g = data.reset_index()
+        if "Date" not in g.columns:
+            g.rename(columns={"index": "Date"}, inplace=True)
         g.insert(0, "Symbol", symbols[0])
         frames.append(g)
 
@@ -211,8 +218,10 @@ def fetch_prices(symbols, period="5y", interval="1d"):
         return pd.DataFrame(columns=["Symbol","Date","Open","High","Low","Close","Adj Close","Volume"])
 
     df = pd.concat(frames, axis=0, ignore_index=True)
+
     # Normalize column names
     df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
     # Ensure expected columns exist
     for col in ["Open","High","Low","Close","Adj Close","Volume"]:
         if col not in df.columns:
@@ -224,12 +233,13 @@ def fetch_prices(symbols, period="5y", interval="1d"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # Ensure datetime
-    if not np.issubdtype(df["Date"].dtype, np.datetime64):
+    if "Date" in df.columns and not np.issubdtype(df["Date"].dtype, np.datetime64):
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 
     # De-duplicate on (Symbol, Date)
     df = df.dropna(subset=["Date"]).sort_values(["Symbol","Date"])
     df = df[~df[["Date","Symbol"]].duplicated(keep="last")]
+
     return df
 
 # ---------------------------
@@ -239,9 +249,7 @@ st.sidebar.title("Controls")
 
 market = st.sidebar.selectbox("Market", list(UNIVERSES.keys()), index=0)
 symbols_default = UNIVERSES[market]
-symbols = st.sidebar.multiselect(
-    "Symbols", options=symbols_default, default=symbols_default
-)
+symbols = st.sidebar.multiselect("Symbols", options=symbols_default, default=symbols_default)
 
 period = st.sidebar.selectbox("History Window", PERIODS, index=2)  # default 5y
 interval = st.sidebar.selectbox("Sampling Interval", INTERVALS, index=0)
@@ -263,15 +271,15 @@ svm_c = st.sidebar.selectbox("SVM: C", [0.1, 0.5, 1.0, 2.0, 5.0], index=2)
 mlp_hidden = st.sidebar.selectbox("ANN (MLP): hidden units", [32, 64, 128], index=1)
 
 st.sidebar.markdown("---")
-st.sidebar.caption("IBR Objectives: EDA first • Compare RF, SVM, ANN • Cover developed & emerging markets • Sharpe/Drawdown & basic explainability")
+st.sidebar.caption("IBR Objectives: EDA first • Compare RF, SVM, ANN • Sharpe/Drawdown & basic explainability")
 
 # ---------------------------
 # HEADER
 # ---------------------------
 st.title("IBR Finance — Exploratory Analysis & ML Model Comparison")
 st.markdown(
-    "A research‑grade dashboard aligned to your objectives: EDA → feature building → **RF vs SVM vs ANN** next‑day direction, "
-    "with backtests and risk‑adjusted metrics. No uploads required — data fetched automatically from Yahoo Finance."
+    "A research-grade dashboard aligned to your objectives: EDA → feature building → **RF vs SVM vs ANN** next-day direction, "
+    "with backtests and risk-adjusted metrics. No uploads required — data fetched automatically from Yahoo Finance."
 )
 
 # ---------------------------
@@ -288,7 +296,6 @@ if raw.empty:
     st.error("No data was returned for the selected inputs. Try a different market/period/interval.")
     st.stop()
 
-# EDA-ready
 raw = raw.sort_values(["Symbol","Date"]).reset_index(drop=True)
 
 # ---------------------------
@@ -351,7 +358,7 @@ with st.spinner("Computing technical indicators..."):
 
 corr_cols = ["Return","LogRet","SMA_20","SMA_50","EMA_12","EMA_26","MACD","MACD_Signal","RSI_14","Volatility_20"]
 corr_df = enriched[enriched["Symbol"] == eda_symbol][corr_cols].dropna()
-if len(corr_df) > 0:
+if len(corr_df) > 3:
     corr = corr_df.corr(numeric_only=True)
     cfig = px.imshow(corr, text_auto=True, aspect="auto", title=f"Correlation Heatmap — {eda_symbol}")
     cfig.update_layout(height=500)
@@ -367,7 +374,10 @@ latest = (
     .reset_index(drop=True)
 )
 st.markdown("#### Latest snapshot")
-st.dataframe(latest.style.format({"Adj Close":"{:,.2f}", "RSI_14":"{:,.1f}", "Volatility_20":"{:,.2f}"}), use_container_width=True)
+st.dataframe(
+    latest.style.format({"Adj Close":"{:,.2f}", "RSI_14":"{:,.1f}", "Volatility_20":"{:,.2f}"}),
+    use_container_width=True
+)
 
 st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
@@ -376,15 +386,12 @@ st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 # ---------------------------
 st.markdown("## 2) Model Comparison — RF vs SVM vs ANN (MLP)")
 
-# Build supervised ML frame across all selected symbols
 ml_df, features = prepare_ml_frame(enriched, horizon=horizon)
-
-# Split train/test chronologically (last 'test_size_years' years as test)
 if ml_df.empty:
     st.error("Insufficient data after feature engineering. Try increasing period or using daily interval.")
     st.stop()
 
-# Determine cutoff date for test
+# Split train/test chronologically (last 'test_size_years' years as test)
 max_date = ml_df["Date"].max()
 cutoff = max_date - pd.DateOffset(years=test_size_years)
 train = ml_df[ml_df["Date"] < cutoff].copy()
@@ -425,40 +432,31 @@ pipelines = {
     ])
 }
 
-# Time-series CV for in-sample sanity (optional, compact)
 tscv = TimeSeriesSplit(n_splits=n_splits)
 
 with st.spinner("Training and evaluating models..."):
-    rows = []
-    proba_dict = {}
-    preds_dict = {}
+    rows, proba_dict, preds_dict = [], {}, {}
 
     for name, pipe in pipelines.items():
-        # Fit on all training data (clean approach; CV score for info)
-        # Quick CV accuracy
+        # quick CV accuracy for info
         cv_scores = []
         for tr_idx, va_idx in tscv.split(X_train):
             X_tr, X_va = X_train[tr_idx], X_train[va_idx]
             y_tr, y_va = y_train[tr_idx], y_train[va_idx]
             p = pipe.fit(X_tr, y_tr)
-            y_va_hat = p.predict(X_va)
-            acc = accuracy_score(y_va, y_va_hat)
-            cv_scores.append(acc)
+            cv_scores.append(accuracy_score(y_va, p.predict(X_va)))
 
-        # Final fit on full train and test
         pipe.fit(X_train, y_train)
         y_hat = pipe.predict(X_test)
-        # Some classifiers expose predict_proba; SVM with probability=True has it
+
+        # proba (fallbacks handled)
         if hasattr(pipe[-1], "predict_proba"):
             y_proba = pipe.predict_proba(X_test)[:, 1]
+        elif hasattr(pipe[-1], "decision_function"):
+            dfunc = pipe.decision_function(X_test)
+            y_proba = 1 / (1 + np.exp(-dfunc))
         else:
-            # Fallback to decision_function if available, map to [0,1] via logistic
-            if hasattr(pipe[-1], "decision_function"):
-                dfunc = pipe.decision_function(X_test)
-                y_proba = 1 / (1 + np.exp(-dfunc))
-            else:
-                # Last resort: 0/1
-                y_proba = y_hat.astype(float)
+            y_proba = y_hat.astype(float)
 
         proba_dict[name] = y_proba
         preds_dict[name] = y_hat
@@ -475,12 +473,8 @@ with st.spinner("Training and evaluating models..."):
 
         rows.append({
             "Model": name,
-            "CV Acc (mean)": np.mean(cv_scores),
-            "Test Acc": acc,
-            "Precision": prec,
-            "Recall": rec,
-            "F1": f1,
-            "ROC-AUC": auc
+            "CV Acc (mean)": float(np.mean(cv_scores)),
+            "Test Acc": acc, "Precision": prec, "Recall": rec, "F1": f1, "ROC-AUC": auc
         })
 
     metrics_df = pd.DataFrame(rows).sort_values("Test Acc", ascending=False)
@@ -498,32 +492,25 @@ st.dataframe(
     use_container_width=True
 )
 
-# Backtest: convert predictions to positions (+1 for long if proba>0.5) per symbol, aggregate equally
-bt = test[["Date","Symbol","LogRet"]].copy()
-bt = bt.reset_index(drop=True)
+# Backtest: long/flat by proba>0.5, equal-weight across symbols
+bt = test[["Date","Symbol","LogRet"]].copy().reset_index(drop=True)
 
-bt_curves = {}
-risk_rows = []
-
+bt_curves, risk_rows = {}, []
 for name, proba in proba_dict.items():
-    # signal per row aligned with test
-    sig = (proba > 0.5).astype(int) * 1.0  # long or flat
-    # Position applied to next period's return (avoid lookahead by shifting signal)
-    pos = pd.Series(sig).shift(1).fillna(0.0).values
+    if len(proba) != len(bt):
+        # very defensive alignment fallback
+        proba = np.resize(proba, len(bt))
+    sig = (proba > 0.5).astype(int) * 1.0
+    pos = pd.Series(sig).shift(1).fillna(0.0).values  # avoid lookahead
 
     strat_ret = pos * bt["LogRet"].values
-    # Aggregate across symbols by equal weight on each date
     df_tmp = bt.copy()
     df_tmp["StratRet"] = strat_ret
-    # daily (or weekly/monthly) aggregation by date: equally-weighted across symbols
-    eq = df_tmp.groupby("Date")["StratRet"].mean()
+    eq = df_tmp.groupby("Date", as_index=True)["StratRet"].mean()
     cum = (1 + eq).cumprod()
 
     bt_curves[name] = cum
-
-    sh = sharpe_ratio(eq.values)
-    mdd = max_drawdown(cum.values)
-    risk_rows.append({"Model": name, "Sharpe": sh, "Max Drawdown": mdd})
+    risk_rows.append({"Model": name, "Sharpe": sharpe_ratio(eq.values), "Max Drawdown": max_drawdown(cum.values)})
 
 risk_df = pd.DataFrame(risk_rows).sort_values("Sharpe", ascending=False)
 
@@ -537,7 +524,7 @@ with colX:
     st.plotly_chart(fig_bt, use_container_width=True)
 
 with colY:
-    st.markdown("#### Risk‑adjusted performance")
+    st.markdown("#### Risk-adjusted performance")
     st.dataframe(
         risk_df.style.format({"Sharpe":"{:.2f}", "Max Drawdown":"{:.1%}"}),
         use_container_width=True
@@ -546,7 +533,7 @@ with colY:
 # Confusion matrices
 st.markdown("#### Confusion matrices (Out-of-sample)")
 cm_cols = st.columns(3)
-for (name, yhat), container in zip(preds_dict.items(), cm_cols):
+for (name, yhat), container in zip(list(preds_dict.items())[:3], cm_cols):
     cm = confusion_matrix(y_test, yhat)
     z = pd.DataFrame(cm, index=["Actual 0","Actual 1"], columns=["Pred 0","Pred 1"])
     with container:
@@ -555,18 +542,17 @@ for (name, yhat), container in zip(preds_dict.items(), cm_cols):
         st.plotly_chart(fig_cm, use_container_width=True)
 
 # Feature importance (RF only)
-if "RandomForest" in pipelines:
-    rf = pipelines["RandomForest"].fit(X_train, y_train)
-    try:
-        importances = rf[-1].feature_importances_
-        fi = pd.DataFrame({"Feature": features, "Importance": importances}).sort_values("Importance", ascending=False)
-        st.markdown("#### RF — Feature importance (Gini)")
-        st.dataframe(fi, use_container_width=True)
-        fi_fig = px.bar(fi.head(12), x="Importance", y="Feature", orientation="h", title="Top features (RF)")
-        fi_fig.update_layout(height=400)
-        st.plotly_chart(fi_fig, use_container_width=True)
-    except Exception:
-        st.info("Feature importance not available.")
+rf = pipelines["RandomForest"].fit(X_train, y_train)
+try:
+    importances = rf[-1].feature_importances_
+    fi = pd.DataFrame({"Feature": features, "Importance": importances}).sort_values("Importance", ascending=False)
+    st.markdown("#### RF — Feature importance (Gini)")
+    st.dataframe(fi, use_container_width=True)
+    fi_fig = px.bar(fi.head(12), x="Importance", y="Feature", orientation="h", title="Top features (RF)")
+    fi_fig.update_layout(height=400)
+    st.plotly_chart(fi_fig, use_container_width=True)
+except Exception:
+    st.info("Feature importance not available.")
 
 st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
@@ -576,11 +562,10 @@ st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 st.markdown("## 3) Notes & Alignment to Objectives")
 st.markdown("""
 - **EDA first**: coverage, missingness, distributions, rolling volatility, correlations, and key technicals are surfaced before modeling.  
-- **Model comparison**: clean, like‑for‑like setup for **RF vs SVM vs ANN (MLP)** on next‑day direction across selected markets.  
-- **Risk & Backtest**: simple, transparent long/flat strategy from predicted direction → equity curves, **Sharpe** & **Max Drawdown**.  
+- **Model comparison**: like-for-like setup for **RF vs SVM vs ANN (MLP)** on next-day direction across selected markets.  
+- **Risk & Backtest**: transparent long/flat strategy from predicted direction → equity curves, **Sharpe** & **Max Drawdown**.  
 - **No uploads**: Data pulled via Yahoo Finance (`yfinance`).  
 - **Emerging vs Developed**: quick toggles for India/Brazil/South Africa vs US/UK (extend the ticker lists as needed).  
-- **Method guards**: time‑series split, scaling only within pipelines (prevents leakage), horizon shift, and post‑fit evaluation on strictly out‑of‑sample data.
+- **Method guards**: time-series split, scaling inside pipelines, horizon shift, and strict out-of-sample evaluation.
 """)
-
-st.markdown("> Tip: to broaden the study, add more tickers to `UNIVERSES`, or extend features (e.g., macro factors, sector dummies).")
+st.markdown("> Tip: add macro/sector features or widen ticker sets in `UNIVERSES` to expand the study.")
