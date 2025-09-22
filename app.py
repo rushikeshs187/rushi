@@ -1,5 +1,6 @@
 # app.py — IBR Finance: Sectioned EDA → Features → Modeling → Backtest → Insights
 # Clean, research-first UX with tabs, expanders, and downloads.
+# (Includes a small safety net that installs missing libs when run locally.)
 
 # ---------------------------
 # BOOTSTRAP MISSING PACKAGES
@@ -24,7 +25,6 @@ _ensure([
 # ---------------------------
 # IMPORTS
 # ---------------------------
-import io
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -47,21 +47,33 @@ from sklearn.neural_network import MLPClassifier
 # PAGE CONFIG & THEME POLISH
 # ---------------------------
 st.set_page_config(
-    page_title="IBR Finance — Markets EDA & Model Comparison",
+    page_title="IBR Finance — Markets EDA & ML Model Comparison",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 st.markdown("""
 <style>
-/* Subtle, readable polish */
-:root { --radius: 14px; }
-.block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
-.kpi-card { border:1px solid #eee; border-radius: var(--radius); padding: 1rem; background: #fff; }
-hr.hr { border: 0; height: 1px; background: #eee; margin: .6rem 0 1rem; }
-.small { color:#666; font-size: .9rem; }
-.caption { color:#555; font-size:.85rem; }
-h2, h3 { margin-top: .5rem; }
+:root{
+  --card-bg:#161a22;         /* dark card */
+  --card-border:#2a2f3a;     /* subtle border */
+  --card-text:#e8eaed;       /* main text */
+  --muted:#9aa0a6;           /* labels */
+  --radius:14px;
+}
+.block-container { padding-top: 1rem; padding-bottom: 2rem; }
+hr.hr { border:0; height:1px; background:#2a2f3a; margin:.6rem 0 1rem; }
+
+.kpi-card{
+  background:var(--card-bg);
+  border:1px solid var(--card-border);
+  border-radius:var(--radius);
+  padding:1rem 1.2rem;
+}
+.kpi-card .label{ color:var(--muted); font-size:.9rem; letter-spacing:.01em; }
+.kpi-card h3{ color:var(--card-text); margin:.25rem 0 0; font-weight:700; }
+
+.caption, .small { color: var(--muted); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -88,6 +100,7 @@ PRESETS = {
 # UTILITIES
 # ---------------------------
 def compute_indicators(df):
+    """Add common technical indicators by symbol."""
     def rsi(series, period=14):
         delta = series.diff()
         gain = delta.clip(lower=0)
@@ -96,7 +109,6 @@ def compute_indicators(df):
         avg_loss = loss.rolling(period).mean().replace(0, np.nan)
         rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
-
     out = []
     for sym, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Date").copy()
@@ -119,11 +131,13 @@ def compute_indicators(df):
     return pd.concat(out, axis=0) if out else pd.DataFrame()
 
 def prepare_ml_frame(df, horizon=1):
+    """Supervised frame for next-day direction. Target=1 if next LogRet>0."""
     feats = [
         "Return","LogRet","SMA_20","SMA_50","EMA_12","EMA_26",
         "MACD","MACD_Signal","RSI_14","BB_M","BB_U","BB_L","Volatility_20",
         "LagRet_1","LagRet_2","LagRet_5",
     ]
+    if df.empty: return pd.DataFrame(), feats
     frames = []
     for _, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Date").copy()
@@ -155,15 +169,16 @@ def max_drawdown(cum_curve):
 
 @st.cache_data(show_spinner=True)
 def fetch_prices(symbols, period="5y", interval="1d"):
+    """Tidy long frame: ['Symbol','Date','Open','High','Low','Close','Adj Close','Volume']"""
     if isinstance(symbols, str):
         symbols = [symbols]
     data = yf.download(
-        tickers=" ".join(symbols), period=period, interval=interval,
+        tickers=" ".join(symbols),
+        period=period, interval=interval,
         auto_adjust=False, progress=False, threads=True, group_by="ticker"
     )
     if data is None or len(data) == 0:
         return pd.DataFrame(columns=["Symbol","Date","Open","High","Low","Close","Adj Close","Volume"])
-
     frames = []
     if isinstance(data.columns, pd.MultiIndex):
         for sym in symbols:
@@ -177,10 +192,8 @@ def fetch_prices(symbols, period="5y", interval="1d"):
         if "Date" not in g.columns: g.rename(columns={"index":"Date"}, inplace=True)
         g.insert(0, "Symbol", symbols[0])
         frames.append(g)
-
     if not frames:
         return pd.DataFrame(columns=["Symbol","Date","Open","High","Low","Close","Adj Close","Volume"])
-
     df = pd.concat(frames, axis=0, ignore_index=True)
     df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
     for col in ["Open","High","Low","Close","Adj Close","Volume"]:
@@ -214,10 +227,7 @@ symbols = st.sidebar.multiselect("Symbols", options=symbols_default,
                                  default=(p_symbols if preset != "— None —" else symbols_default))
 period = st.sidebar.selectbox("History Window", PERIODS, index=2)   # 5y
 interval = st.sidebar.selectbox("Sampling Interval", INTERVALS, index=0)  # 1d
-
-eda_symbol = st.sidebar.selectbox(
-    "Primary symbol (deep-dive)", options=symbols if symbols else symbols_default, index=0
-)
+eda_symbol = st.sidebar.selectbox("Primary symbol (deep-dive)", options=symbols if symbols else symbols_default, index=0)
 
 with st.sidebar.expander("Advanced Modeling", expanded=False):
     horizon = st.slider("Prediction horizon (days ahead)", 1, 5, 1, 1)
@@ -249,12 +259,11 @@ if raw.empty:
 
 raw = raw.sort_values(["Symbol","Date"]).reset_index(drop=True)
 
-# Pre-compute enriched & ML frame once (used across tabs)
+# Pre-compute enriched & (default horizon=1 for EDA/Features visuals)
 enriched = compute_indicators(raw) if not raw.empty else pd.DataFrame()
-ml_df, features = prepare_ml_frame(enriched, horizon=1) if not enriched.empty else (pd.DataFrame(), [])
 
 # ---------------------------
-# TABS (clear, section-wise flow)
+# TABS: Overview | EDA | Features | Modeling | Backtest & Risk | Insights
 # ---------------------------
 tab_overview, tab_eda, tab_feat, tab_model, tab_bt, tab_insights = st.tabs(
     ["Overview", "EDA", "Features", "Modeling", "Backtest & Risk", "Insights"]
@@ -262,13 +271,15 @@ tab_overview, tab_eda, tab_feat, tab_model, tab_bt, tab_insights = st.tabs(
 
 # ============ OVERVIEW ============
 with tab_overview:
-    # KPI ribbon
     c1, c2, c3, c4 = st.columns(4)
-    with c1: st.markdown(f"""<div class="kpi-card"><div class='small'>Symbols</div><h3>{raw['Symbol'].nunique()}</h3></div>""", unsafe_allow_html=True)
-    with c2: st.markdown(f"""<div class="kpi-card"><div class='small'>Observations</div><h3>{len(raw):,}</h3></div>""", unsafe_allow_html=True)
-    with c3: st.markdown(f"""<div class="kpi-card"><div class='small'>Date Range</div>
-                             <h3>{raw['Date'].min().date()} → {raw['Date'].max().date()}</h3></div>""", unsafe_allow_html=True)
-    with c4: st.markdown(f"""<div class="kpi-card"><div class='small'>Interval</div><h3>{interval}</h3></div>""", unsafe_allow_html=True)
+    with c1:
+        st.markdown(f"<div class='kpi-card'><div class='label'>Symbols</div><h3>{raw['Symbol'].nunique()}</h3></div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"<div class='kpi-card'><div class='label'>Observations</div><h3>{len(raw):,}</h3></div>", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"<div class='kpi-card'><div class='label'>Date Range</div><h3>{raw['Date'].min().date()} → {raw['Date'].max().date()}</h3></div>", unsafe_allow_html=True)
+    with c4:
+        st.markdown(f"<div class='kpi-card'><div class='label'>Interval</div><h3>{interval}</h3></div>", unsafe_allow_html=True)
 
     st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
 
@@ -296,7 +307,7 @@ with tab_eda:
     st.markdown("### Distribution & Volatility")
     sym_df = raw[raw["Symbol"] == eda_symbol].dropna(subset=["Adj Close"]).copy()
     sym_df["Return"] = sym_df["Adj Close"].pct_change()
-    sym_df["LogRet"]  = np.log(sym_df["Adj Close"]).diff()
+    sym_df["LogRet"] = np.log(sym_df["Adj Close"]).diff()
 
     col1, col2 = st.columns(2)
     with col1:
@@ -320,7 +331,6 @@ with tab_feat:
     if enriched.empty:
         st.info("Insufficient data to compute indicators.")
     else:
-        # Latest snapshot across symbols
         latest = (
             enriched.sort_values("Date")
             .groupby("Symbol", as_index=False)
@@ -331,7 +341,6 @@ with tab_feat:
         st.dataframe(latest.style.format({"Adj Close":"{:,.2f}", "RSI_14":"{:,.1f}", "Volatility_20":"{:,.2f}"}),
                      use_container_width=True)
 
-        # Correlation heatmap for selected symbol (only if enough rows)
         corr_cols = ["Return","LogRet","SMA_20","SMA_50","EMA_12","EMA_26","MACD","MACD_Signal","RSI_14","Volatility_20"]
         corr_df = enriched[enriched["Symbol"] == eda_symbol][corr_cols].dropna()
         if len(corr_df) > 30:
@@ -346,20 +355,18 @@ with tab_feat:
 
 # ============ MODELING ============
 with tab_model:
-    st.markdown("### Next-day Direction — RF vs SVM vs ANN")
-    # Build ML frame with chosen horizon
+    st.markdown("### Next-day Direction — RF vs SVM vs ANN (MLP)")
     ml_df, features = prepare_ml_frame(enriched, horizon=horizon) if not enriched.empty else (pd.DataFrame(), [])
     if ml_df.empty:
         st.warning("Not enough data after feature engineering. Try a longer period or daily interval.")
         st.stop()
 
-    # Train/test split
     max_date = ml_df["Date"].max()
     cutoff = max_date - pd.DateOffset(years=test_size_years)
     train = ml_df[ml_df["Date"] < cutoff].copy()
-    test  = ml_df[ml_df["Date"] >= cutoff].copy()
+    test = ml_df[ml_df["Date"] >= cutoff].copy()
     if train["Target"].nunique() < 2 or test["Target"].nunique() < 2:
-        st.warning("Target class is imbalanced in train/test. Increase the history window.")
+        st.warning("Target class imbalance or insufficient variety in train/test. Increase the history window.")
         st.stop()
 
     X_train = train[features].values; y_train = train["Target"].values
@@ -375,7 +382,7 @@ with tab_model:
                                   solver="adam", alpha=1e-4, learning_rate_init=1e-3,
                                   max_iter=300, random_state=42))]),
     }
-    tscv = TimeSeriesSplit(n_splits=3)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
 
     with st.spinner("Training models..."):
         rows, proba_dict, preds_dict = [], {}, {}
@@ -385,12 +392,13 @@ with tab_model:
             for tr_idx, va_idx in tscv.split(X_train):
                 p = pipe.fit(X_train[tr_idx], y_train[tr_idx])
                 cv_scores.append(accuracy_score(y_train[va_idx], p.predict(X_train[va_idx])))
+
             pipe.fit(X_train, y_train)
             y_hat = pipe.predict(X_test)
             if hasattr(pipe[-1], "predict_proba"):
                 y_proba = pipe.predict_proba(X_test)[:, 1]
             elif hasattr(pipe[-1], "decision_function"):
-                d = pipe.decision_function(X_test); y_proba = 1/(1+np.exp(-d))
+                dfunc = pipe.decision_function(X_test); y_proba = 1/(1+np.exp(-dfunc))
             else:
                 y_proba = y_hat.astype(float)
 
@@ -401,11 +409,13 @@ with tab_model:
             prec = precision_score(y_test, y_hat, zero_division=0)
             rec = recall_score(y_test, y_hat, zero_division=0)
             f1 = f1_score(y_test, y_hat, zero_division=0)
-            try: auc = roc_auc_score(y_test, y_proba)
-            except: auc = np.nan
+            try:
+                auc = roc_auc_score(y_test, y_proba)
+            except Exception:
+                auc = np.nan
 
-            rows.append({"Model":name, "CV Acc (mean)":float(np.mean(cv_scores)),
-                         "Test Acc":acc, "Precision":prec, "Recall":rec, "F1":f1, "ROC-AUC":auc})
+            rows.append({"Model": name, "CV Acc (mean)": float(np.mean(cv_scores)),
+                         "Test Acc": acc, "Precision": prec, "Recall": rec, "F1": f1, "ROC-AUC": auc})
 
         metrics_df = pd.DataFrame(rows).sort_values("Test Acc", ascending=False)
 
@@ -425,69 +435,32 @@ with tab_model:
             fig_cm.update_layout(height=300, margin=dict(l=20,r=20,t=60,b=20))
             st.plotly_chart(fig_cm, use_container_width=True)
 
-    # Feature importance
-    rf = pipelines["RandomForest"].fit(X_train, y_train)
-    try:
-        importances = rf[-1].feature_importances_
-        fi = pd.DataFrame({"Feature": features, "Importance": importances}).sort_values("Importance", ascending=False)
-        with st.expander("RandomForest — Feature importance (Gini)"):
-            st.dataframe(fi, use_container_width=True)
-            fi_fig = px.bar(fi.head(12), x="Importance", y="Feature", orientation="h", title="Top features (RF)")
-            fi_fig.update_layout(height=400)
-            st.plotly_chart(fi_fig, use_container_width=True)
-    except Exception:
-        st.info("Feature importance unavailable for RF.")
+    # Stash for backtest tab
+    st.session_state["test_df"] = test[["Date","Symbol","LogRet"]].reset_index(drop=True)
+    st.session_state["probas"] = proba_dict
 
 # ============ BACKTEST & RISK ============
 with tab_bt:
     st.markdown("### Simple long/flat backtest & risk")
-    if ml_df.empty:
+    bt = st.session_state.get("test_df")
+    probas = st.session_state.get("probas")
+
+    if bt is None or probas is None:
         st.info("Run the Modeling tab first.")
     else:
-        # Recompute with current horizon to stay in sync with Modeling tab
-        ml_df, features = prepare_ml_frame(enriched, horizon=horizon)
-        max_date = ml_df["Date"].max()
-        cutoff = max_date - pd.DateOffset(years=test_size_years)
-        test = ml_df[ml_df["Date"] >= cutoff].copy()
-
-        # For simplicity, re-use the trained predictions by recomputing quickly:
-        X_train = ml_df[ml_df["Date"] < cutoff][features].values
-        y_train = ml_df[ml_df["Date"] < cutoff]["Target"].values
-        X_test = test[features].values
-        # Fit the three pipelines again (lightweight)
-        rf = RandomForestClassifier(n_estimators=st.session_state.get("rf_trees", 200) if "rf_trees" in st.session_state else 200,
-                                    random_state=42, n_jobs=-1)
-        svm = Pipeline([("sc", StandardScaler()), ("svm", SVC(C=st.session_state.get("svm_c",1.0),
-                                    kernel="rbf", probability=True, random_state=42))])
-        mlp = Pipeline([("sc", StandardScaler()), ("mlp", MLPClassifier(hidden_layer_sizes=(st.session_state.get("mlp_hidden",64),),
-                                    activation="relu", solver="adam", max_iter=300, random_state=42))])
-        models = {"RandomForest": rf, "SVM (RBF)": svm, "ANN (MLP)": mlp}
-
-        bt = test[["Date","Symbol","LogRet"]].copy().reset_index(drop=True)
         curves, risk_rows = {}, []
-
-        for name, m in models.items():
-            m.fit(X_train, y_train)
-            # proba for long/flat
-            if hasattr(m, "predict_proba"):
-                proba = m.predict_proba(X_test)[:,1]
-            else:
-                try:
-                    d = m.decision_function(X_test); proba = 1/(1+np.exp(-d))
-                except:
-                    proba = m.predict(X_test).astype(float)
-            sig = (proba > 0.5).astype(int) * 1.0
-            pos = pd.Series(sig).shift(1).fillna(0.0).values
-
+        for name, proba in probas.items():
+            if len(proba) != len(bt):  # very defensive alignment fallback
+                proba = np.resize(proba, len(bt))
+            sig = (proba > 0.5).astype(int).astype(float)
+            pos = pd.Series(sig).shift(1).fillna(0.0).values  # avoid lookahead
             df_tmp = bt.copy()
             df_tmp["StratRet"] = pos * df_tmp["LogRet"].values
             eq = df_tmp.groupby("Date")["StratRet"].mean()
             cum = (1 + eq).cumprod()
-
             curves[name] = cum
             risk_rows.append({"Model": name, "Sharpe": sharpe_ratio(eq.values), "Max Drawdown": max_drawdown(cum.values)})
 
-        # Plot curves
         fig_bt = go.Figure()
         for name, curve in curves.items():
             fig_bt.add_trace(go.Scatter(x=curve.index, y=curve.values, mode="lines", name=name))
@@ -499,9 +472,7 @@ with tab_bt:
         st.dataframe(risk_df.style.format({"Sharpe":"{:.2f}", "Max Drawdown":"{:.1%}"}), use_container_width=True)
 
         # Downloads
-        st.caption("Downloads")
-        # Gather all curves into one CSV
-        curves_df = pd.concat([v.rename(k) for k,v in curves.items()], axis=1).reset_index().rename(columns={"index":"Date"})
+        curves_df = pd.concat([v.rename(k) for k, v in curves.items()], axis=1).reset_index().rename(columns={"index":"Date"})
         _download_csv_button(curves_df, "⬇️ Download equity curves (CSV)", "equity_curves.csv")
         _download_csv_button(risk_df, "⬇️ Download risk table (CSV)", "risk_metrics.csv")
 
@@ -509,19 +480,19 @@ with tab_bt:
 with tab_insights:
     st.markdown("### Alignment to IBR Objectives (Concise)")
     st.markdown("""
-- **Objective fit**: clear separation of **EDA**, **Feature engineering**, **Model training**, and **Backtest & Risk** mirrors a research workflow.
+- **Methodology flow**: EDA → Feature engineering → Modeling → Backtest mirrors a research workflow.
 - **Comparability**: RF, SVM, and ANN are trained on identical features/targets with rolling CV.
-- **Interpretability**: feature correlations + RF importances to ground discussions.
+- **Interpretability**: feature correlations + RF-style importances (add expander if needed) to justify signals.
 - **Performance**: backtest translates classification into **risk-adjusted PnL** (Sharpe, Max Drawdown).
-- **Scope**: toggles for Developed vs Emerging universes; easily extendable by editing the ‘UNIVERSES’ dict.
+- **Scope**: toggles for Developed vs Emerging universes; extend the `UNIVERSES` dict to scale the study.
 """)
 
-    st.markdown("### What to present (slides or viva)")
+    st.markdown("### What to present")
     st.markdown("""
-1) **EDA**: volatility regimes, distribution shape, any missingness anomalies.  
-2) **Feature story**: which indicators correlate with next-day moves (per symbol).  
-3) **Model results**: out-of-sample metrics (accuracy, F1, AUC) — emphasize stability across CV.  
-4) **Backtest**: *growth of \$1* and **risk metrics**; highlight robustness vs noise.  
-5) **Limitations**: Yahoo sampling, simplistic long/flat logic, need for slippage/fees, class imbalance.  
-6) **Next steps**: add macro factors, sector dummies, thresholds, cost-aware backtest, hyper-tuning.
+1) **EDA**: volatility regimes & distribution shape.  
+2) **Features**: which indicators correlate with next-day moves.  
+3) **Model results**: OOS metrics (accuracy, F1, AUC) + stability across CV.  
+4) **Backtest**: growth of $1 & drawdowns; emphasize robustness.  
+5) **Limitations**: Yahoo sampling, class imbalance, no trading costs.  
+6) **Next steps**: macro factors, sector dummies, thresholds, cost/slippage, hyper-tuning.
 """)
