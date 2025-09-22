@@ -1,7 +1,8 @@
-# IBR Finance — Dark Themed Research Dashboard
-# Clean header bar, sticky toolbar, crisp KPI cards, and polished Plotly dark theme.
+# IBR Finance — Fully Dark Research Dashboard
+# EDA → Features → Modeling → Backtest & Risk → Insights
+# Polished dark reset (no white flashes), crisp KPIs, consistent Plotly styling.
 
-# --- Safety net: install locally if needed (Cloud will use requirements.txt) ---
+# --- Safety net: install locally if needed (Cloud uses requirements.txt) ---
 def _ensure(pkgs):
     import importlib, sys, subprocess
     for name, pip_name in pkgs:
@@ -43,91 +44,99 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# --- Global Dark Theme (CSS) ---
+# --- DARK RESET (no white anywhere) ---
 st.markdown("""
 <style>
 :root{
   color-scheme: dark;
-  --bg:#0b0e13;               /* main background */
-  --panel:#10151d;            /* header & toolbar */
-  --card:#131a24;             /* content cards */
-  --border:#223044;           /* subtle strokes */
-  --text:#e6edf3;             /* primary text */
-  --muted:#95a3b3;            /* secondary text */
-  --accent:#5f8cff;           /* brand accent (tabs/buttons) */
-  --accent-2:#ff6b6b;         /* highlight (bad/danger) */
+  --bg:#0b0e13;            /* page */
+  --panel:#10151d;         /* sidebar/header/panels */
+  --card:#131a24;          /* cards/tables */
+  --border:#223044;        /* strokes */
+  --text:#e6edf3;          /* main text */
+  --muted:#95a3b3;         /* secondary text */
+  --accent:#5f8cff;        /* brand accent */
+  --accent-2:#ff6b6b;      /* danger */
   --radius:16px;
 }
+/* page, header, sidebar */
+.stApp, html, body, .block-container{ background:var(--bg)!important; }
+[data-testid="stHeader"], [data-testid="stToolbar"]{ background:var(--panel)!important; border-bottom:1px solid var(--border); }
+[data-testid="stSidebar"]{ background:var(--panel)!important; border-right:1px solid var(--border); }
+.block-container{ padding-top:0; padding-bottom:32px }
 
-html, body, .block-container { background: var(--bg); }
-.block-container { padding-top: 0; padding-bottom: 32px; }
+/* sticky header */
+.header{ position:sticky; top:0; z-index:50; background:linear-gradient(180deg,var(--panel),rgba(16,21,29,.75));
+  backdrop-filter:blur(6px); border-bottom:1px solid var(--border); padding:16px 12px 10px; margin:0 -12px 18px }
+.header h1{ margin:0; font-size:1.65rem; color:var(--text) }
+.header .sub{ color:var(--muted); font-size:.95rem; margin-top:2px }
 
-/* --- Header Bar (sticky) --- */
-.header {
-  position: sticky; top: 0; z-index: 50;
-  background: linear-gradient(180deg, var(--panel), rgba(16,21,29,.75));
-  backdrop-filter: blur(6px);
-  border-bottom: 1px solid var(--border);
-  padding: 16px 12px 10px 12px;
-  margin: 0 -12px 18px -12px;
+/* toolbar badges */
+.toolbar{ display:flex; gap:12px; align-items:center; border:1px solid var(--border); border-radius:var(--radius);
+  background:var(--panel); padding:8px 12px; margin-top:10px }
+.badge{ background:#0f1722; border:1px solid var(--border); color:var(--muted); padding:5px 10px; border-radius:999px; font-size:.85rem }
+
+/* tabs */
+.stTabs [data-baseweb="tab-list"]{ gap:18px; border-bottom:1px solid var(--border) }
+.stTabs [data-baseweb="tab"]{ color:var(--text) }
+.stTabs [aria-selected="true"]{ border-bottom:3px solid var(--accent)!important }
+
+/* cards / kpis */
+.card, .kpi{ background:var(--card)!important; border:1px solid var(--border)!important; border-radius:var(--radius); color:var(--text) }
+.kpi{ padding:18px 20px; height:118px; display:flex; flex-direction:column; justify-content:center; box-shadow:0 1px 0 rgba(0,0,0,.25) }
+.kpi .label{ color:var(--muted)!important; font-size:.95rem; margin-bottom:5px }
+.kpi .value{ color:var(--text)!important; font-size:1.9rem; font-weight:800 }
+
+/* text & hr */
+h1,h2,h3,h4,h5,h6,.stMarkdown,.stMarkdown p,label{ color:var(--text)!important; opacity:1!important }
+hr.hr{ border:0; height:1px; background:var(--border); margin:12px 0 16px }
+
+/* buttons & downloads */
+.stButton>button, .stDownloadButton>button{
+  background:var(--panel)!important; color:var(--text)!important; border:1px solid var(--border)!important; border-radius:10px
 }
-.header h1 {
-  margin: 0; font-size: 1.65rem; letter-spacing:.2px; color: var(--text);
+.stButton>button:hover, .stDownloadButton>button:hover{ background:#0f1722!important }
+
+/* inputs */
+[data-baseweb="select"]>div, .stTextInput>div>div, .stNumberInput>div>div, .stDateInput>div>div{
+  background:var(--panel)!important; color:var(--text)!important; border:1px solid var(--border)!important;
 }
-.header .sub { color: var(--muted); font-size: .95rem; margin-top: 2px; }
+[data-baseweb="select"] svg{ fill:var(--muted)!important }
 
-/* --- Toolbar (filters summary) --- */
-.toolbar {
-  display:flex; gap:12px; align-items:center;
-  border:1px solid var(--border); border-radius: var(--radius);
-  background: var(--panel); padding: 8px 12px; margin-top: 10px;
-}
-.badge { background: #0f1722; border:1px solid var(--border); color:var(--muted);
-         padding:5px 10px; border-radius: 999px; font-size:.85rem; }
+/* slider */
+.stSlider [role="slider"]{ background:var(--accent)!important }
 
-/* --- Tabs --- */
-.stTabs [data-baseweb="tab-list"]{ gap: 18px; border-bottom: 1px solid var(--border); }
-.stTabs [data-baseweb="tab"]{ color: var(--text); font-weight:600; }
-.stTabs [aria-selected="true"]{
-  border-bottom: 3px solid var(--accent) !important;
-}
+/* alerts */
+.stAlert{ background:var(--panel)!important; border:1px solid var(--border)!important; color:var(--text)!important }
 
-/* --- Cards & sections --- */
-.section { margin-top: 6px; }
-.card {
-  background: var(--card); border:1px solid var(--border);
-  border-radius: var(--radius); padding: 18px;
-}
-.kpi {
-  background: var(--card); border:1px solid var(--border);
-  border-radius: var(--radius); padding: 18px 20px;
-  height: 118px; display:flex; flex-direction:column; justify-content:center;
-  box-shadow: 0 1px 0 rgba(0,0,0,.25);
-}
-.kpi .label { color: var(--muted); font-size:.95rem; margin-bottom: 5px; }
-.kpi .value { color: var(--text); font-size: 1.9rem; font-weight: 800; }
+/* dataframe (headers, rows, footer) */
+[data-testid="stDataFrame"] *{ color:var(--text)!important }
+[data-testid="stDataFrame"] div, [data-testid="stDataFrame"] canvas{ background:var(--card)!important }
+[data-testid="stDataFrame"] [role="table"]{ background:var(--card)!important }
 
-/* --- Typography --- */
-h2, h3 { color: var(--text) !important; margin: 4px 0 10px 0; }
-hr.hr { border: 0; height: 1px; background: var(--border); margin: 12px 0 16px; }
+/* code blocks */
+pre, code{ background:var(--panel)!important; color:var(--text)!important; border:1px solid var(--border) }
 
-/* --- Streamlit widgets tune-up --- */
-.stSelectbox, .stMultiSelect, .stSlider, .stDownloadButton, .stButton { color: var(--text) !important; }
-
-/* Dataframe grid (dark header) */
-[data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 12px; }
+/* scrollbars */
+*::-webkit-scrollbar{ height:10px; width:10px }
+*::-webkit-scrollbar-track{ background:var(--panel) }
+*::-webkit-scrollbar-thumb{ background:#1d2633; border:2px solid var(--panel); border-radius:10px }
 </style>
 """, unsafe_allow_html=True)
 
-# --- Plotly Theme ---
+# --- Plotly theme (dark tooltips/legend too) ---
 PLOTLY_THEME = dict(
     template="plotly_dark",
     paper_bgcolor="#0b0e13",
     plot_bgcolor="#0b0e13",
     font_color="#e6edf3",
+    hoverlabel_bgcolor="#10151d",
+    hoverlabel_bordercolor="#223044",
+    hoverlabel_font_color="#e6edf3",
+    legend_bgcolor="#0b0e13",
 )
 
-# --- Reference Universes / Presets ---
+# --- Universes / Presets ---
 UNIVERSES = {
     "US (Developed)": ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","JPM","XOM"],
     "UK (Developed)": ["HSBA.L","AZN.L","BP.L","ULVR.L","GSK.L","RIO.L"],
@@ -232,7 +241,7 @@ def kpi(col, label, value):
         </div>
         """, unsafe_allow_html=True)
 
-# --------------------------- Sidebar Controls ---------------------------
+# --------------------------- Sidebar ---------------------------
 st.sidebar.markdown("### ⚙️ Study Controls")
 preset = st.sidebar.selectbox("Preset", ["— None —"] + list(PRESETS.keys()))
 if preset!="— None —":
@@ -255,11 +264,11 @@ with st.sidebar.expander("Advanced Modeling", expanded=False):
     svm_c = st.selectbox("SVM: C", [0.1,0.5,1.0,2.0,5.0], index=2)
     mlp_hidden = st.selectbox("ANN (MLP): hidden units", [32,64,128], index=1)
 
-# --------------------------- Header (Sticky) ---------------------------
+# --------------------------- Header ---------------------------
 st.markdown(f"""
 <div class="header">
   <h1>IBR Finance — Markets EDA & Model Comparison</h1>
-  <div class="sub">A section-first research dashboard: <b>Exploration</b> → <b>Features</b> → <b>Models</b> → <b>Backtest</b> → <b>Insights</b></div>
+  <div class="sub">Exploration → Features → Models → Backtest → Insights</div>
   <div class="toolbar">
     <span class="badge">🌍 {market}</span>
     <span class="badge">📦 {len(symbols)} symbols</span>
@@ -270,17 +279,14 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# --------------------------- Data Load ---------------------------
+# --------------------------- Data ---------------------------
 if not symbols:
-    st.warning("Pick at least one symbol to proceed.")
-    st.stop()
+    st.warning("Pick at least one symbol to proceed."); st.stop()
 
 with st.spinner("Fetching market data..."):
     raw = fetch_prices(symbols, period=period, interval=interval)
-
 if raw.empty:
-    st.error("No data returned for selected inputs. Try another market/period/interval.")
-    st.stop()
+    st.error("No data returned for selected inputs. Try another market/period/interval."); st.stop()
 
 raw = raw.sort_values(["Symbol","Date"]).reset_index(drop=True)
 enriched = compute_indicators(raw) if not raw.empty else pd.DataFrame()
@@ -292,14 +298,11 @@ tab_overview, tab_eda, tab_feat, tab_model, tab_bt, tab_insights = st.tabs(
 
 # ===== Overview =====
 with tab_overview:
-    st.markdown('<div class="section">', unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4, gap="large")
     kpi(c1, "Symbols", f"{raw['Symbol'].nunique():,}")
     kpi(c2, "Observations", f"{len(raw):,}")
     kpi(c3, "Date Range", f"{raw['Date'].min().date()} → {raw['Date'].max().date()}")
     kpi(c4, "Interval", f"{interval}")
-    st.markdown('</div>', unsafe_allow_html=True)
-
     st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
 
     sym = eda_symbol
@@ -307,12 +310,12 @@ with tab_overview:
     sym_df["SMA_20"] = sym_df["Adj Close"].rolling(20).mean()
     sym_df["SMA_50"] = sym_df["Adj Close"].rolling(50).mean()
 
-    price = go.Figure()
-    price.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["Adj Close"], mode="lines", name=f"{sym} Adj Close"))
-    price.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["SMA_20"], mode="lines", name="SMA 20"))
-    price.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["SMA_50"], mode="lines", name="SMA 50"))
-    price.update_layout(height=380, title=f"{sym} — Price & SMAs", xaxis_title=None, yaxis_title="Adj Close", **PLOTLY_THEME)
-    st.plotly_chart(price, use_container_width=True)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["Adj Close"], mode="lines", name=f"{sym} Adj Close"))
+    fig.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["SMA_20"], mode="lines", name="SMA 20"))
+    fig.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["SMA_50"], mode="lines", name="SMA 50"))
+    fig.update_layout(height=380, title=f"{sym} — Price & SMAs", xaxis_title=None, yaxis_title="Adj Close", **PLOTLY_THEME)
+    st.plotly_chart(fig, use_container_width=True)
 
     left, right = st.columns([3,1])
     with left:
@@ -325,30 +328,27 @@ with tab_overview:
 
 # ===== EDA =====
 with tab_eda:
-    st.markdown('<div class="section">', unsafe_allow_html=True)
     sym_df = raw[raw["Symbol"]==eda_symbol].dropna(subset=["Adj Close"]).copy()
     sym_df["Return"]=sym_df["Adj Close"].pct_change()
     sym_df["LogRet"]=np.log(sym_df["Adj Close"]).diff()
 
-    left, right = st.columns(2, gap="large")
-    with left:
+    col1, col2 = st.columns(2, gap="large")
+    with col1:
         hist = px.histogram(sym_df, x="Return", nbins=60, title=f"{eda_symbol} — Daily Return Distribution")
         hist.update_layout(height=320, **PLOTLY_THEME)
         st.plotly_chart(hist, use_container_width=True)
-    with right:
+    with col2:
         roll = sym_df.set_index("Date")["Return"].rolling(20).std()*np.sqrt(252)
-        vol = go.Figure()
-        vol.add_trace(go.Scatter(x=roll.index, y=roll.values, mode="lines", name="Ann. Vol (20d)"))
-        vol.update_layout(height=320, title=f"{eda_symbol} — Rolling Annualized Volatility (20d)", **PLOTLY_THEME)
-        st.plotly_chart(vol, use_container_width=True)
+        rfig = go.Figure()
+        rfig.add_trace(go.Scatter(x=roll.index, y=roll.values, mode="lines", name="Ann. Vol (20d)"))
+        rfig.update_layout(height=320, title=f"{eda_symbol} — Rolling Annualized Volatility (20d)", **PLOTLY_THEME)
+        st.plotly_chart(rfig, use_container_width=True)
 
     with st.expander("Summary stats"):
         st.dataframe(sym_df[["Adj Close","Return","LogRet","Volume"]].describe().T, use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== Features =====
 with tab_feat:
-    st.markdown('<div class="section">', unsafe_allow_html=True)
     if enriched.empty:
         st.info("Insufficient data to compute indicators.")
     else:
@@ -359,21 +359,20 @@ with tab_feat:
             .reset_index(drop=True)
         )
         st.markdown("**Latest snapshot**")
-        st.dataframe(latest.style.format({"Adj Close":"{:,.2f}", "RSI_14":"{:,.1f}", "Volatility_20":"{:,.2f}"}), use_container_width=True)
+        st.dataframe(latest.style.format({"Adj Close":"{:,.2f}", "RSI_14":"{:,.1f}", "Volatility_20":"{:,.2f}"}),
+                     use_container_width=True)
 
         corr_cols=["Return","LogRet","SMA_20","SMA_50","EMA_12","EMA_26","MACD","MACD_Signal","RSI_14","Volatility_20"]
-        cdf=enriched[enriched["Symbol"]==eda_symbol][corr_cols].dropna()
-        if len(cdf)>30:
-            heat = px.imshow(cdf.corr(numeric_only=True), text_auto=True, aspect="auto", title=f"{eda_symbol} — Feature Correlation")
-            heat.update_layout(height=520, **PLOTLY_THEME)
-            st.plotly_chart(heat, use_container_width=True)
+        corr_df=enriched[enriched["Symbol"]==eda_symbol][corr_cols].dropna()
+        if len(corr_df)>30:
+            cfig = px.imshow(corr_df.corr(numeric_only=True), text_auto=True, aspect="auto", title=f"{eda_symbol} — Feature Correlation")
+            cfig.update_layout(height=520, **PLOTLY_THEME)
+            st.plotly_chart(cfig, use_container_width=True)
         else:
             st.info("Not enough rows (>30) for a stable correlation heatmap.")
-    st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== Modeling =====
 with tab_model:
-    st.markdown('<div class="section">', unsafe_allow_html=True)
     ml_df, features = prepare_ml_frame(enriched, horizon=horizon) if not enriched.empty else (pd.DataFrame(), [])
     if ml_df.empty:
         st.warning("Not enough data after feature engineering. Try a longer period or daily interval."); st.stop()
@@ -406,9 +405,14 @@ with tab_model:
             elif hasattr(pipe[-1],"decision_function"): d=pipe.decision_function(X_test); y_proba=1/(1+np.exp(-d))
             else: y_proba=y_hat.astype(float)
             proba_dict[name]=y_proba; preds_dict[name]=y_hat
-            rows.append({"Model":name,"CV Acc (mean)":float(np.mean(cv)),"Test Acc":accuracy_score(y_test,y_hat),
-                         "Precision":precision_score(y_test,y_hat,zero_division=0),"Recall":recall_score(y_test,y_hat,zero_division=0),
-                         "F1":f1_score(y_test,y_hat,zero_division=0),"ROC-AUC":roc_auc_score(y_test,y_proba) if len(np.unique(y_test))==2 else np.nan})
+            rows.append({
+                "Model":name, "CV Acc (mean)":float(np.mean(cv)),
+                "Test Acc":accuracy_score(y_test,y_hat),
+                "Precision":precision_score(y_test,y_hat,zero_division=0),
+                "Recall":recall_score(y_test,y_hat,zero_division=0),
+                "F1":f1_score(y_test,y_hat,zero_division=0),
+                "ROC-AUC":roc_auc_score(y_test,y_proba) if len(np.unique(y_test))==2 else np.nan
+            })
         metrics=pd.DataFrame(rows).sort_values("Test Acc", ascending=False)
 
     st.subheader("Out-of-sample metrics")
@@ -427,11 +431,9 @@ with tab_model:
     # stash for backtest
     st.session_state["test_df"]=test[["Date","Symbol","LogRet"]].reset_index(drop=True)
     st.session_state["probas"]=proba_dict
-    st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== Backtest & Risk =====
 with tab_bt:
-    st.markdown('<div class="section">', unsafe_allow_html=True)
     bt=st.session_state.get("test_df"); probas=st.session_state.get("probas")
     if bt is None or probas is None:
         st.info("Run the Modeling tab first.")
@@ -448,24 +450,25 @@ with tab_bt:
         fig_bt=go.Figure()
         for name, curve in curves.items():
             fig_bt.add_trace(go.Scatter(x=curve.index, y=curve.values, mode="lines", name=name))
-        fig_bt.update_layout(height=380, title="Equity Curves — equal-weight, long/flat by model signal", yaxis_title="Growth of $1", **PLOTLY_THEME)
+        fig_bt.update_layout(height=380, title="Equity Curves — equal-weight, long/flat by model signal",
+                             yaxis_title="Growth of $1", **PLOTLY_THEME)
         st.plotly_chart(fig_bt, use_container_width=True)
 
         risk=pd.DataFrame(risk_rows).sort_values("Sharpe", ascending=False)
         st.dataframe(risk.style.format({"Sharpe":"{:.2f}","Max Drawdown":"{:.1%}"}), use_container_width=True)
-        dl_button(pd.concat([v.rename(k) for k,v in curves.items()], axis=1).reset_index().rename(columns={"index":"Date"}), "⬇️ Equity curves (CSV)", "equity_curves.csv")
+        dl_button(pd.concat([v.rename(k) for k,v in curves.items()], axis=1).reset_index().rename(columns={"index":"Date"}),
+                  "⬇️ Equity curves (CSV)", "equity_curves.csv")
         dl_button(risk, "⬇️ Risk metrics (CSV)", "risk_metrics.csv")
-    st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== Insights =====
 with tab_insights:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### Insights & Alignment")
     st.markdown("""
-- **Flow**: EDA → Feature engineering → Modeling → Backtest mirrors a research workflow for reproducibility.
+- **Flow**: EDA → Feature engineering → Modeling → Backtest mirrors a research workflow.
 - **Comparability**: RF, SVM, MLP trained on identical features with rolling CV.
 - **Interpretability**: correlations (and optionally RF importances) justify signal.
-- **Risk**: backtest outputs **Sharpe** and **Max Drawdown** for decision-making.
-- **Extend**: add macro factors, sector tags, slippage/costs, and threshold tuning for robust deployment.
+- **Risk**: backtest outputs **Sharpe** and **Max Drawdown** for decisions.
+- **Extend**: add macro factors, sector tags, slippage/costs, thresholding, and hyper-tuning.
 """)
     st.markdown('</div>', unsafe_allow_html=True)
