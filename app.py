@@ -1,6 +1,7 @@
-# app.py — IBR Finance (clean dark UI + fixed KPI contrast/alignment)
+# IBR Finance — Dark Themed Research Dashboard
+# Clean header bar, sticky toolbar, crisp KPI cards, and polished Plotly dark theme.
 
-# ---------- safety net ----------
+# --- Safety net: install locally if needed (Cloud will use requirements.txt) ---
 def _ensure(pkgs):
     import importlib, sys, subprocess
     for name, pip_name in pkgs:
@@ -18,13 +19,14 @@ _ensure([
     ("sklearn","scikit-learn>=1.3"),
 ])
 
-# ---------- imports ----------
+# --- Imports ---
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import TimeSeriesSplit
@@ -33,55 +35,99 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.neural_network import MLPClassifier
 
-# ---------- page config ----------
-st.set_page_config(page_title="IBR Finance — Markets EDA & ML Model Comparison", layout="wide", initial_sidebar_state="expanded")
+# --- Page config ---
+st.set_page_config(
+    page_title="IBR Finance — Research Dashboard",
+    page_icon="🌓",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ---------- CSS (strong specificity so numbers are NOT faded) ----------
+# --- Global Dark Theme (CSS) ---
 st.markdown("""
 <style>
 :root{
   color-scheme: dark;
-  --bg:#0f1116; --panel:#12161f; --card:#161a22; --border:#2a2f3a;
-  --text:#e8eaed; --muted:#9aa0a6; --accent:#ff4b4b; --radius:16px;
-}
-html, body, .block-container{ background:var(--bg) }
-.block-container{ padding-top:14px; padding-bottom:28px }
-
-.stTabs [data-baseweb="tab-list"]{ gap:16px; border-bottom:1px solid var(--border) }
-.stTabs [data-baseweb="tab"]{ color:var(--text) }
-.stTabs [aria-selected="true"]{ border-bottom:3px solid var(--accent)!important }
-
-hr.hr{ border:0; height:1px; background:var(--border); margin:.75rem 0 1.25rem }
-
-/* KPI card with fixed height; strong color override */
-.kpi-card{
-  background:var(--card);
-  border:1px solid var(--border);
-  border-radius:var(--radius);
-  padding:18px 20px;
-  height:120px;
-  display:flex; flex-direction:column; justify-content:center;
-  box-shadow:0 1px 0 rgba(0,0,0,.25);
-}
-.kpi-card .label{
-  color:var(--muted)!important;
-  opacity:1!important; letter-spacing:.01em; font-size:.95rem; margin-bottom:6px;
-}
-.kpi-card .value, .kpi-card .value *{
-  color:var(--text)!important;
-  opacity:1!important; filter:none!important;
-  font-size:1.9rem; font-weight:800; line-height:1.1; margin:0;
+  --bg:#0b0e13;               /* main background */
+  --panel:#10151d;            /* header & toolbar */
+  --card:#131a24;             /* content cards */
+  --border:#223044;           /* subtle strokes */
+  --text:#e6edf3;             /* primary text */
+  --muted:#95a3b3;            /* secondary text */
+  --accent:#5f8cff;           /* brand accent (tabs/buttons) */
+  --accent-2:#ff6b6b;         /* highlight (bad/danger) */
+  --radius:16px;
 }
 
-/* also kill global opacity Streamlit sometimes applies */
-h1,h2,h3,h4,h5,h6, .stMarkdown, .stMarkdown p { color:var(--text)!important; opacity:1!important }
+html, body, .block-container { background: var(--bg); }
+.block-container { padding-top: 0; padding-bottom: 32px; }
+
+/* --- Header Bar (sticky) --- */
+.header {
+  position: sticky; top: 0; z-index: 50;
+  background: linear-gradient(180deg, var(--panel), rgba(16,21,29,.75));
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--border);
+  padding: 16px 12px 10px 12px;
+  margin: 0 -12px 18px -12px;
+}
+.header h1 {
+  margin: 0; font-size: 1.65rem; letter-spacing:.2px; color: var(--text);
+}
+.header .sub { color: var(--muted); font-size: .95rem; margin-top: 2px; }
+
+/* --- Toolbar (filters summary) --- */
+.toolbar {
+  display:flex; gap:12px; align-items:center;
+  border:1px solid var(--border); border-radius: var(--radius);
+  background: var(--panel); padding: 8px 12px; margin-top: 10px;
+}
+.badge { background: #0f1722; border:1px solid var(--border); color:var(--muted);
+         padding:5px 10px; border-radius: 999px; font-size:.85rem; }
+
+/* --- Tabs --- */
+.stTabs [data-baseweb="tab-list"]{ gap: 18px; border-bottom: 1px solid var(--border); }
+.stTabs [data-baseweb="tab"]{ color: var(--text); font-weight:600; }
+.stTabs [aria-selected="true"]{
+  border-bottom: 3px solid var(--accent) !important;
+}
+
+/* --- Cards & sections --- */
+.section { margin-top: 6px; }
+.card {
+  background: var(--card); border:1px solid var(--border);
+  border-radius: var(--radius); padding: 18px;
+}
+.kpi {
+  background: var(--card); border:1px solid var(--border);
+  border-radius: var(--radius); padding: 18px 20px;
+  height: 118px; display:flex; flex-direction:column; justify-content:center;
+  box-shadow: 0 1px 0 rgba(0,0,0,.25);
+}
+.kpi .label { color: var(--muted); font-size:.95rem; margin-bottom: 5px; }
+.kpi .value { color: var(--text); font-size: 1.9rem; font-weight: 800; }
+
+/* --- Typography --- */
+h2, h3 { color: var(--text) !important; margin: 4px 0 10px 0; }
+hr.hr { border: 0; height: 1px; background: var(--border); margin: 12px 0 16px; }
+
+/* --- Streamlit widgets tune-up --- */
+.stSelectbox, .stMultiSelect, .stSlider, .stDownloadButton, .stButton { color: var(--text) !important; }
+
+/* Dataframe grid (dark header) */
+[data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 12px; }
 </style>
 """, unsafe_allow_html=True)
 
-# Plotly theme to match the dark palette
-PLOTLY_THEME = dict(template="plotly_dark", paper_bgcolor="#0f1116", plot_bgcolor="#0f1116", font_color="#e8eaed")
+# --- Plotly Theme ---
+PLOTLY_THEME = dict(
+    template="plotly_dark",
+    paper_bgcolor="#0b0e13",
+    plot_bgcolor="#0b0e13",
+    font_color="#e6edf3",
+)
 
-# ---------- universes/presets ----------
+# --- Reference Universes / Presets ---
 UNIVERSES = {
     "US (Developed)": ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","JPM","XOM"],
     "UK (Developed)": ["HSBA.L","AZN.L","BP.L","ULVR.L","GSK.L","RIO.L"],
@@ -97,11 +143,11 @@ PRESETS = {
     "Emerging study":  ["India (Emerging)", ["RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS"]],
 }
 
-# ---------- utils ----------
+# --- Helpers ---
 def compute_indicators(df):
-    def rsi(x, period=14):
+    def rsi(x, n=14):
         d = x.diff(); g = d.clip(lower=0); l = -d.clip(upper=0)
-        ag = g.rolling(period).mean(); al = l.rolling(period).mean().replace(0,np.nan)
+        ag = g.rolling(n).mean(); al = l.rolling(n).mean().replace(0, np.nan)
         rs = ag/al; return 100 - (100/(1+rs))
     out=[]
     for _, g in df.groupby("Symbol", sort=False):
@@ -173,22 +219,22 @@ def fetch_prices(symbols, period="5y", interval="1d"):
     df=df[~df[["Date","Symbol"]].duplicated(keep="last")]
     return df.reset_index(drop=True)
 
-def _download_csv_button(df, label, name):
-    if df is None or df.empty: return
-    st.download_button(label, df.to_csv(index=False).encode("utf-8"), name, "text/csv")
+def dl_button(df, label, name):
+    if df is not None and not df.empty:
+        st.download_button(label, df.to_csv(index=False).encode("utf-8"), name, "text/csv")
 
-# Small helper to render a crisp KPI (solves color + alignment)
-def render_kpi(label: str, value: str):
-    st.markdown(f"""
-    <div class="kpi-card">
-      <div class="label">{label}</div>
-      <div class="value" style="color:#e8eaed!important;opacity:1!important">{value}</div>
-    </div>
-    """, unsafe_allow_html=True)
+def kpi(col, label, value):
+    with col:
+        st.markdown(f"""
+        <div class="kpi">
+          <div class="label">{label}</div>
+          <div class="value">{value}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-# ---------- sidebar ----------
-st.sidebar.title("Study Controls")
-preset = st.sidebar.selectbox("Preset", ["— None —"] + list(PRESETS.keys()), index=0)
+# --------------------------- Sidebar Controls ---------------------------
+st.sidebar.markdown("### ⚙️ Study Controls")
+preset = st.sidebar.selectbox("Preset", ["— None —"] + list(PRESETS.keys()))
 if preset!="— None —":
     p_market, p_symbols = PRESETS[preset]
 else:
@@ -209,79 +255,100 @@ with st.sidebar.expander("Advanced Modeling", expanded=False):
     svm_c = st.selectbox("SVM: C", [0.1,0.5,1.0,2.0,5.0], index=2)
     mlp_hidden = st.selectbox("ANN (MLP): hidden units", [32,64,128], index=1)
 
-# ---------- header ----------
-st.subheader("IBR Finance — Markets EDA & ML Model Comparison")
-st.caption("Section-first dashboard aligned to research objectives: **Exploration → Features → Models → Backtest → Insights**")
+# --------------------------- Header (Sticky) ---------------------------
+st.markdown(f"""
+<div class="header">
+  <h1>IBR Finance — Markets EDA & Model Comparison</h1>
+  <div class="sub">A section-first research dashboard: <b>Exploration</b> → <b>Features</b> → <b>Models</b> → <b>Backtest</b> → <b>Insights</b></div>
+  <div class="toolbar">
+    <span class="badge">🌍 {market}</span>
+    <span class="badge">📦 {len(symbols)} symbols</span>
+    <span class="badge">🗓 {period}</span>
+    <span class="badge">⏱ {interval}</span>
+    <span class="badge">🎯 horizon {horizon}d</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-# ---------- data load ----------
+# --------------------------- Data Load ---------------------------
 if not symbols:
-    st.warning("Pick at least one symbol to proceed."); st.stop()
+    st.warning("Pick at least one symbol to proceed.")
+    st.stop()
 
 with st.spinner("Fetching market data..."):
     raw = fetch_prices(symbols, period=period, interval=interval)
 
 if raw.empty:
-    st.error("No data returned for selected inputs."); st.stop()
+    st.error("No data returned for selected inputs. Try another market/period/interval.")
+    st.stop()
 
 raw = raw.sort_values(["Symbol","Date"]).reset_index(drop=True)
 enriched = compute_indicators(raw) if not raw.empty else pd.DataFrame()
 
-# ---------- tabs ----------
+# --------------------------- Tabs ---------------------------
 tab_overview, tab_eda, tab_feat, tab_model, tab_bt, tab_insights = st.tabs(
-    ["Overview","EDA","Features","Modeling","Backtest & Risk","Insights"]
+    ["Overview", "EDA", "Features", "Modeling", "Backtest & Risk", "Insights"]
 )
 
 # ===== Overview =====
 with tab_overview:
+    st.markdown('<div class="section">', unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4, gap="large")
-    with c1: render_kpi("Symbols", f"{raw['Symbol'].nunique():,}")
-    with c2: render_kpi("Observations", f"{len(raw):,}")
-    with c3: render_kpi("Date Range", f"{raw['Date'].min().date()} → {raw['Date'].max().date()}")
-    with c4: render_kpi("Interval", f"{interval}")
+    kpi(c1, "Symbols", f"{raw['Symbol'].nunique():,}")
+    kpi(c2, "Observations", f"{len(raw):,}")
+    kpi(c3, "Date Range", f"{raw['Date'].min().date()} → {raw['Date'].max().date()}")
+    kpi(c4, "Interval", f"{interval}")
+    st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
 
-    sym_df = raw[raw["Symbol"]==eda_symbol].dropna(subset=["Adj Close"]).copy()
-    sym_df["SMA_20"]=sym_df["Adj Close"].rolling(20).mean()
-    sym_df["SMA_50"]=sym_df["Adj Close"].rolling(50).mean()
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["Adj Close"], mode="lines", name=f"{eda_symbol} Adj Close"))
-    fig.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["SMA_20"], mode="lines", name="SMA 20"))
-    fig.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["SMA_50"], mode="lines", name="SMA 50"))
-    fig.update_layout(height=380, title=f"{eda_symbol} — Price & SMAs", xaxis_title=None, yaxis_title="Adj Close", **PLOTLY_THEME)
-    st.plotly_chart(fig, use_container_width=True)
+    sym = eda_symbol
+    sym_df = raw[raw["Symbol"]==sym].dropna(subset=["Adj Close"]).copy()
+    sym_df["SMA_20"] = sym_df["Adj Close"].rolling(20).mean()
+    sym_df["SMA_50"] = sym_df["Adj Close"].rolling(50).mean()
 
-    colL, colR = st.columns([3,1])
-    with colL:
-        st.caption("Download raw dataset")
-        _download_csv_button(raw, "⬇️ Download prices (CSV)", f"prices_{market.replace(' ','_')}.csv")
-    with colR: st.write("")
+    price = go.Figure()
+    price.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["Adj Close"], mode="lines", name=f"{sym} Adj Close"))
+    price.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["SMA_20"], mode="lines", name="SMA 20"))
+    price.add_trace(go.Scatter(x=sym_df["Date"], y=sym_df["SMA_50"], mode="lines", name="SMA 50"))
+    price.update_layout(height=380, title=f"{sym} — Price & SMAs", xaxis_title=None, yaxis_title="Adj Close", **PLOTLY_THEME)
+    st.plotly_chart(price, use_container_width=True)
+
+    left, right = st.columns([3,1])
+    with left:
+        st.markdown('<div class="card">Download datasets</div>', unsafe_allow_html=True)
+        dl_button(raw, "⬇️ Prices (CSV)", f"prices_{market.replace(' ','_')}.csv")
+        if not enriched.empty:
+            dl_button(enriched, "⬇️ Enriched features (CSV)", "enriched_features.csv")
+    with right:
+        st.empty()
 
 # ===== EDA =====
 with tab_eda:
-    st.markdown("### Distribution & Volatility")
+    st.markdown('<div class="section">', unsafe_allow_html=True)
     sym_df = raw[raw["Symbol"]==eda_symbol].dropna(subset=["Adj Close"]).copy()
     sym_df["Return"]=sym_df["Adj Close"].pct_change()
     sym_df["LogRet"]=np.log(sym_df["Adj Close"]).diff()
 
-    col1, col2 = st.columns(2, gap="large")
-    with col1:
+    left, right = st.columns(2, gap="large")
+    with left:
         hist = px.histogram(sym_df, x="Return", nbins=60, title=f"{eda_symbol} — Daily Return Distribution")
         hist.update_layout(height=320, **PLOTLY_THEME)
         st.plotly_chart(hist, use_container_width=True)
-    with col2:
+    with right:
         roll = sym_df.set_index("Date")["Return"].rolling(20).std()*np.sqrt(252)
-        rfig = go.Figure()
-        rfig.add_trace(go.Scatter(x=roll.index, y=roll.values, mode="lines", name="Ann. Vol (20d)"))
-        rfig.update_layout(height=320, title=f"{eda_symbol} — Rolling Annualized Volatility (20d)", **PLOTLY_THEME)
-        st.plotly_chart(rfig, use_container_width=True)
+        vol = go.Figure()
+        vol.add_trace(go.Scatter(x=roll.index, y=roll.values, mode="lines", name="Ann. Vol (20d)"))
+        vol.update_layout(height=320, title=f"{eda_symbol} — Rolling Annualized Volatility (20d)", **PLOTLY_THEME)
+        st.plotly_chart(vol, use_container_width=True)
 
     with st.expander("Summary stats"):
         st.dataframe(sym_df[["Adj Close","Return","LogRet","Volume"]].describe().T, use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== Features =====
 with tab_feat:
-    st.markdown("### Technical Indicators & Correlations")
+    st.markdown('<div class="section">', unsafe_allow_html=True)
     if enriched.empty:
         st.info("Insufficient data to compute indicators.")
     else:
@@ -295,19 +362,18 @@ with tab_feat:
         st.dataframe(latest.style.format({"Adj Close":"{:,.2f}", "RSI_14":"{:,.1f}", "Volatility_20":"{:,.2f}"}), use_container_width=True)
 
         corr_cols=["Return","LogRet","SMA_20","SMA_50","EMA_12","EMA_26","MACD","MACD_Signal","RSI_14","Volatility_20"]
-        corr_df=enriched[enriched["Symbol"]==eda_symbol][corr_cols].dropna()
-        if len(corr_df)>30:
-            cfig=px.imshow(corr_df.corr(numeric_only=True), text_auto=True, aspect="auto", title=f"{eda_symbol} — Feature Correlation")
-            cfig.update_layout(height=520, **PLOTLY_THEME)
-            st.plotly_chart(cfig, use_container_width=True)
+        cdf=enriched[enriched["Symbol"]==eda_symbol][corr_cols].dropna()
+        if len(cdf)>30:
+            heat = px.imshow(cdf.corr(numeric_only=True), text_auto=True, aspect="auto", title=f"{eda_symbol} — Feature Correlation")
+            heat.update_layout(height=520, **PLOTLY_THEME)
+            st.plotly_chart(heat, use_container_width=True)
         else:
-            st.info("Not enough rows for a stable correlation heatmap (need >30).")
-
-        _download_csv_button(enriched, "⬇️ Download enriched (CSV)", "enriched_features.csv")
+            st.info("Not enough rows (>30) for a stable correlation heatmap.")
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== Modeling =====
 with tab_model:
-    st.markdown("### Next-day Direction — RF vs SVM vs ANN (MLP)")
+    st.markdown('<div class="section">', unsafe_allow_html=True)
     ml_df, features = prepare_ml_frame(enriched, horizon=horizon) if not enriched.empty else (pd.DataFrame(), [])
     if ml_df.empty:
         st.warning("Not enough data after feature engineering. Try a longer period or daily interval."); st.stop()
@@ -317,45 +383,39 @@ with tab_model:
     if train["Target"].nunique()<2 or test["Target"].nunique()<2:
         st.warning("Target class imbalance or insufficient variety. Increase history window."); st.stop()
 
-    X_train=train[features].values; y_train=train["Target"].values
-    X_test=test[features].values; y_test=test["Target"].values
+    X_train, y_train = train[features].values, train["Target"].values
+    X_test,  y_test  = test[features].values,  test["Target"].values
 
-    pipelines={
+    models = {
         "RandomForest": Pipeline([("rf", RandomForestClassifier(n_estimators=rf_trees, random_state=42, n_jobs=-1))]),
         "SVM (RBF)"  : Pipeline([("sc", StandardScaler()), ("svm", SVC(C=svm_c, kernel="rbf", gamma="scale", probability=True, random_state=42))]),
         "ANN (MLP)"  : Pipeline([("sc", StandardScaler()), ("mlp", MLPClassifier(hidden_layer_sizes=(mlp_hidden,), activation="relu", solver="adam", max_iter=300, random_state=42))]),
     }
-    tscv=TimeSeriesSplit(n_splits=n_splits)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
 
     with st.spinner("Training models..."):
         rows=[]; proba_dict={}; preds_dict={}
-        for name, pipe in pipelines.items():
+        for name, pipe in models.items():
             cv=[]
             for tr, va in tscv.split(X_train):
                 p=pipe.fit(X_train[tr], y_train[tr])
                 cv.append(accuracy_score(y_train[va], p.predict(X_train[va])))
             pipe.fit(X_train, y_train)
             y_hat=pipe.predict(X_test)
-            if hasattr(pipe[-1], "predict_proba"): y_proba=pipe.predict_proba(X_test)[:,1]
-            elif hasattr(pipe[-1], "decision_function"): d=pipe.decision_function(X_test); y_proba=1/(1+np.exp(-d))
+            if hasattr(pipe[-1],"predict_proba"): y_proba=pipe.predict_proba(X_test)[:,1]
+            elif hasattr(pipe[-1],"decision_function"): d=pipe.decision_function(X_test); y_proba=1/(1+np.exp(-d))
             else: y_proba=y_hat.astype(float)
             proba_dict[name]=y_proba; preds_dict[name]=y_hat
-            rows.append({
-                "Model":name,
-                "CV Acc (mean)":float(np.mean(cv)),
-                "Test Acc":accuracy_score(y_test,y_hat),
-                "Precision":precision_score(y_test,y_hat,zero_division=0),
-                "Recall":recall_score(y_test,y_hat,zero_division=0),
-                "F1":f1_score(y_test,y_hat,zero_division=0),
-                "ROC-AUC":roc_auc_score(y_test,y_proba) if len(np.unique(y_test))==2 else np.nan
-            })
-        metrics_df=pd.DataFrame(rows).sort_values("Test Acc", ascending=False)
+            rows.append({"Model":name,"CV Acc (mean)":float(np.mean(cv)),"Test Acc":accuracy_score(y_test,y_hat),
+                         "Precision":precision_score(y_test,y_hat,zero_division=0),"Recall":recall_score(y_test,y_hat,zero_division=0),
+                         "F1":f1_score(y_test,y_hat,zero_division=0),"ROC-AUC":roc_auc_score(y_test,y_proba) if len(np.unique(y_test))==2 else np.nan})
+        metrics=pd.DataFrame(rows).sort_values("Test Acc", ascending=False)
 
-    st.markdown("**Out-of-sample metrics**")
-    st.dataframe(metrics_df.style.format({"CV Acc (mean)":"{:.3f}","Test Acc":"{:.3f}","Precision":"{:.3f}","Recall":"{:.3f}","F1":"{:.3f}","ROC-AUC":"{:.3f}"}), use_container_width=True)
-    _download_csv_button(metrics_df, "⬇️ Download metrics (CSV)", "model_metrics.csv")
+    st.subheader("Out-of-sample metrics")
+    st.dataframe(metrics.style.format({"CV Acc (mean)":"{:.3f}","Test Acc":"{:.3f}","Precision":"{:.3f}","Recall":"{:.3f}","F1":"{:.3f}","ROC-AUC":"{:.3f}"}), use_container_width=True)
+    dl_button(metrics, "⬇️ Metrics (CSV)", "model_metrics.csv")
 
-    st.markdown("**Confusion matrices**")
+    st.subheader("Confusion matrices")
     cols = st.columns(3, gap="large")
     for (name, yhat), c in zip(list(preds_dict.items())[:3], cols):
         cm=confusion_matrix(y_test, yhat)
@@ -367,10 +427,11 @@ with tab_model:
     # stash for backtest
     st.session_state["test_df"]=test[["Date","Symbol","LogRet"]].reset_index(drop=True)
     st.session_state["probas"]=proba_dict
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== Backtest & Risk =====
 with tab_bt:
-    st.markdown("### Simple long/flat backtest & risk")
+    st.markdown('<div class="section">', unsafe_allow_html=True)
     bt=st.session_state.get("test_df"); probas=st.session_state.get("probas")
     if bt is None or probas is None:
         st.info("Run the Modeling tab first.")
@@ -387,22 +448,24 @@ with tab_bt:
         fig_bt=go.Figure()
         for name, curve in curves.items():
             fig_bt.add_trace(go.Scatter(x=curve.index, y=curve.values, mode="lines", name=name))
-        fig_bt.update_layout(height=380, title="Equity Curves (equal-weight, long/flat by model signal)", yaxis_title="Growth of $1", **PLOTLY_THEME)
+        fig_bt.update_layout(height=380, title="Equity Curves — equal-weight, long/flat by model signal", yaxis_title="Growth of $1", **PLOTLY_THEME)
         st.plotly_chart(fig_bt, use_container_width=True)
 
-        risk_df=pd.DataFrame(risk_rows).sort_values("Sharpe", ascending=False)
-        st.dataframe(risk_df.style.format({"Sharpe":"{:.2f}","Max Drawdown":"{:.1%}"}), use_container_width=True)
-
-        curves_df=pd.concat([v.rename(k) for k,v in curves.items()], axis=1).reset_index().rename(columns={"index":"Date"})
-        _download_csv_button(curves_df, "⬇️ Download equity curves (CSV)", "equity_curves.csv")
-        _download_csv_button(risk_df, "⬇️ Download risk table (CSV)", "risk_metrics.csv")
+        risk=pd.DataFrame(risk_rows).sort_values("Sharpe", ascending=False)
+        st.dataframe(risk.style.format({"Sharpe":"{:.2f}","Max Drawdown":"{:.1%}"}), use_container_width=True)
+        dl_button(pd.concat([v.rename(k) for k,v in curves.items()], axis=1).reset_index().rename(columns={"index":"Date"}), "⬇️ Equity curves (CSV)", "equity_curves.csv")
+        dl_button(risk, "⬇️ Risk metrics (CSV)", "risk_metrics.csv")
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== Insights =====
 with tab_insights:
-    st.markdown("### Alignment to IBR Objectives (Concise)")
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### Insights & Alignment")
     st.markdown("""
-- **Methodology flow**: EDA → Feature engineering → Modeling → Backtest mirrors a research workflow.
-- **Comparability**: RF, SVM, and ANN trained on identical features with rolling CV.
-- **Interpretability**: feature correlations (+ optional RF importances) justify signals.
-- **Performance**: backtest → **Sharpe & Max Drawdown** for risk-aware comparison.
+- **Flow**: EDA → Feature engineering → Modeling → Backtest mirrors a research workflow for reproducibility.
+- **Comparability**: RF, SVM, MLP trained on identical features with rolling CV.
+- **Interpretability**: correlations (and optionally RF importances) justify signal.
+- **Risk**: backtest outputs **Sharpe** and **Max Drawdown** for decision-making.
+- **Extend**: add macro factors, sector tags, slippage/costs, and threshold tuning for robust deployment.
 """)
+    st.markdown('</div>', unsafe_allow_html=True)
