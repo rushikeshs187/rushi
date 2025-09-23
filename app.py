@@ -1,6 +1,5 @@
-# IBR Finance — Fully Dark Research Dashboard
-# EDA → Features → Modeling → Backtest & Risk → Insights
-# Polished dark reset (no white flashes), crisp KPIs, consistent Plotly styling.
+# IBR Finance — Fully Dark Research Dashboard (KPI values in accent color)
+# Flow: EDA → Features → Modeling → Backtest & Risk → Insights
 
 # --- Safety net: install locally if needed (Cloud uses requirements.txt) ---
 def _ensure(pkgs):
@@ -44,7 +43,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# --- DARK RESET (no white anywhere) ---
+# --- DARK RESET (strict dark everywhere) + KPI accent support ---
 st.markdown("""
 <style>
 :root{
@@ -85,7 +84,10 @@ st.markdown("""
 .card, .kpi{ background:var(--card)!important; border:1px solid var(--border)!important; border-radius:var(--radius); color:var(--text) }
 .kpi{ padding:18px 20px; height:118px; display:flex; flex-direction:column; justify-content:center; box-shadow:0 1px 0 rgba(0,0,0,.25) }
 .kpi .label{ color:var(--muted)!important; font-size:.95rem; margin-bottom:5px }
-.kpi .value{ color:var(--text)!important; font-size:1.9rem; font-weight:800 }
+/* KPI values: default + tones */
+.kpi .value{ font-size:1.9rem; font-weight:800; }
+.kpi--accent .value{ color:var(--accent)!important; }
+.kpi--soft   .value{ color:#b6c2d6!important; }  /* optional softer neutral */
 
 /* text & hr */
 h1,h2,h3,h4,h5,h6,.stMarkdown,.stMarkdown p,label{ color:var(--text)!important; opacity:1!important }
@@ -124,7 +126,7 @@ pre, code{ background:var(--panel)!important; color:var(--text)!important; borde
 </style>
 """, unsafe_allow_html=True)
 
-# --- Plotly theme (dark tooltips/legend too) ---
+# --- Plotly theme (dark tooltips/legend) ---
 PLOTLY_THEME = dict(
     template="plotly_dark",
     paper_bgcolor="#0b0e13",
@@ -232,10 +234,11 @@ def dl_button(df, label, name):
     if df is not None and not df.empty:
         st.download_button(label, df.to_csv(index=False).encode("utf-8"), name, "text/csv")
 
-def kpi(col, label, value):
+# KPI helper with "tone": "accent" (bright) or "soft" (neutral)
+def kpi(col, label, value, tone="accent"):
     with col:
         st.markdown(f"""
-        <div class="kpi">
+        <div class="kpi kpi--{tone}">
           <div class="label">{label}</div>
           <div class="value">{value}</div>
         </div>
@@ -243,6 +246,10 @@ def kpi(col, label, value):
 
 # --------------------------- Sidebar ---------------------------
 st.sidebar.markdown("### ⚙️ Study Controls")
+PRESETS = {
+    "Developed study": ["US (Developed)", ["AAPL","MSFT","NVDA","AMZN","GOOGL","META"]],
+    "Emerging study":  ["India (Emerging)", ["RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS"]],
+}
 preset = st.sidebar.selectbox("Preset", ["— None —"] + list(PRESETS.keys()))
 if preset!="— None —":
     p_market, p_symbols = PRESETS[preset]
@@ -299,10 +306,12 @@ tab_overview, tab_eda, tab_feat, tab_model, tab_bt, tab_insights = st.tabs(
 # ===== Overview =====
 with tab_overview:
     c1, c2, c3, c4 = st.columns(4, gap="large")
-    kpi(c1, "Symbols", f"{raw['Symbol'].nunique():,}")
-    kpi(c2, "Observations", f"{len(raw):,}")
-    kpi(c3, "Date Range", f"{raw['Date'].min().date()} → {raw['Date'].max().date()}")
-    kpi(c4, "Interval", f"{interval}")
+    # KPI values in accent color (theme-matched)
+    kpi(c1, "Symbols",      f"{raw['Symbol'].nunique():,}", tone="accent")
+    kpi(c2, "Observations", f"{len(raw):,}",                tone="accent")
+    kpi(c3, "Date Range",   f"{raw['Date'].min().date()} → {raw['Date'].max().date()}", tone="accent")
+    kpi(c4, "Interval",     f"{interval}",                  tone="accent")
+
     st.markdown("<hr class='hr'/>", unsafe_allow_html=True)
 
     sym = eda_symbol
